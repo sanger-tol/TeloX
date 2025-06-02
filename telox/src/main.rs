@@ -1,194 +1,348 @@
+use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
-use std::collections::HashMap;
+use std::io::{self, BufRead, Write};
+use std::path::Path;
 
-const SEQ_NT4_TABLE: [u8; 256] = {
-    let mut table = [0u8; 256];
-    table[b'A' as usize] = 1;
-    table[b'C' as usize] = 2;
-    table[b'G' as usize] = 3;
-    table[b'T' as usize] = 4;
-    table[b'a' as usize] = 1;
-    table[b'c' as usize] = 2;
-    table[b'g' as usize] = 3;
-    table[b't' as usize] = 4;
-    table
-};
+// Constants
+const TELO_PENALTY: i64 = 1;
+const TELO_MAX_DROP: i64 = 2000;
+const TELO_MIN_SCORE: i64 = 300;
+static TELO_MOTIF_DB: &[&str] = &[
+    "AAAATTGTCCGTCC",
+    "AAACCACCCT",
+    "AAACCC",
+    "AAACCCC",
+    "AAACCCT",
+    "AAAGAACCT",
+    "AAATGTGGAGG",
+    "AACAGACCCG",
+    "AACCATCCCT",
+    "AACCC",
+    "AACCCAGACCC",
+    "AACCCAGACCT",
+    "AACCCAGACGC",
+    "AACCCCAACCT",
+    "AACCCGAACCT",
+    "AACCCT",
+    "AACCCTG",
+    "AACCCTGACGC",
+    "AACCT",
+    "AAGGAC",
+    "ACCCAG",
+    "ACCTG",
+    "ACGGCAGCG",
+];
+
+// Nucleotide table (similar to seq_nt6_table)
+const SEQ_NT6_TABLE: [u8; 256] = [
+    0, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 1, 5, 2, 5, 5, 5, 3, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 1, 5, 2, 5, 5, 5, 3, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+];
+
+struct Sequence {
+    name: String,
+    seq: String,
+}
+
+struct SequenceDict {
+    sequences: Vec<Sequence>,
+}
+
+impl SequenceDict {
+    fn from_fasta<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let reader = io::BufReader::new(file);
+        let mut sequences = Vec::new();
+        let mut current_name = String::new();
+        let mut current_seq = String::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.starts_with('>') {
+                if !current_name.is_empty() {
+                    sequences.push(Sequence {
+                        name: current_name.clone(),
+                        seq: current_seq.clone(),
+                    });
+                    current_seq.clear();
+                }
+                current_name = line[1..].trim().to_string();
+            } else {
+                current_seq.push_str(&line.trim().to_uppercase());
+            }
+        }
+
+        if !current_name.is_empty() {
+            sequences.push(Sequence {
+                name: current_name,
+                seq: current_seq,
+            });
+        }
+
+        Ok(Self { sequences })
+    }
+}
 
 fn check_motif(motif: &str) -> bool {
-    motif.chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T'))
+    for c in motif.chars() {
+        let val = SEQ_NT6_TABLE[c as usize];
+        if val < 1 || val > 4 {
+            return false;
+        }
+    }
+    true
 }
 
-fn encode_kmer(motif: &str) -> u64 {
-    motif.bytes().fold(0, |acc, b| {
-        (acc << 2) | SEQ_NT4_TABLE[b as usize] as u64
-    })
+fn list_telo_motifs(out: &mut impl Write) -> io::Result<()> {
+    for (i, motif) in TELO_MOTIF_DB.iter().enumerate() {
+        writeln!(out, "[{:2}] {}", i + 1, motif)?;
+    }
+    Ok(())
 }
 
-fn encode_revcomp_kmer(motif: &str) -> u64 {
-    motif
-        .bytes()
-        .rev()
-        .fold(0, |acc, b| {
-            let nt = SEQ_NT4_TABLE[b as usize];
-            let rc = match nt {
-                1 => 4, // A -> T
-                2 => 3, // C -> G
-                3 => 2, // G -> C
-                4 => 1, // T -> A
-                _ => 0,
-            };
-            (acc << 2) | rc as u64
-        })
-}
-
-fn telo_finder_core(sequence: &str, motif: &str) -> u64 {
+fn telo_finder_core(
+    sequence: &str,
+    mtab: &HashSet<u64>,
+    mlen: usize,
+    penalty: i64,
+    max_drop: i64,
+    min_score: i64,
+) -> u64 {
     let slen = sequence.len();
-    if slen < motif.len() || motif.len() == 0 || !check_motif(motif) {
-        return 0;
-    }
+    let mut sum_telo = 0u64;
+    let mask = (1u64 << (2 * mlen)) - 1;
 
-    let mlen = motif.len();
-    let mask: u64 = (1 << (2 * mlen)) - 1;
-    let mut sum_telo = 0;
+    // Check 5' end
+    let mut score = 0i64;
+    let mut max_score = 0i64;
+    let mut max_i = -1isize;
+    let mut x = 0u64;
+    let mut l = 0usize;
 
-    let motif_val = encode_kmer(motif);
-    let motif_rev = encode_revcomp_kmer(motif);
-
-    // --- 5' end ---
-    let mut max_score = 0;
-    let mut max_i = None;
-    let mut score = 0;
-    let mut x = 0;
-
-    for i in 0..slen {
-        let nt = SEQ_NT4_TABLE[sequence.as_bytes()[i] as usize];
-        if nt == 0 {
+    for (i, c) in sequence.chars().enumerate() {
+        let nt = SEQ_NT6_TABLE[c as usize];
+        let hit = if (1..=4).contains(&nt) {
+            x = ((x << 2) | (nt - 1) as u64) & mask;
+            l += 1;
+            l >= mlen && mtab.contains(&x)
+        } else {
+            l = 0;
             x = 0;
-            score = 0;
-            continue;
-        }
-
-        x = ((x << 2) | nt as u64) & mask;
-
-        if i + 1 >= mlen {
-            if x == motif_val {
-                score += 1;
-            } else {
-                score = 0;
-            }
-            if score > max_score {
-                max_score = score;
-                max_i = Some(i);
-            }
-        }
-    }
-
-    if let Some(i) = max_i {
-        let end_pos = i + 1;
-        sum_telo += (end_pos as u64) << 32;
-    }
-
-    // --- 3' end ---
-    max_score = 0;
-    max_i = None;
-    score = 0;
-    x = 0;
-
-    for i in (0..slen).rev() {
-        let nt = SEQ_NT4_TABLE[sequence.as_bytes()[i] as usize];
-        if nt == 0 {
-            x = 0;
-            score = 0;
-            continue;
-        }
-
-        // Reverse complement logic
-        let rc = match nt {
-            1 => 4,
-            2 => 3,
-            3 => 2,
-            4 => 1,
-            _ => 0,
+            false
         };
 
-        x = ((x << 2) | rc as u64) & mask;
-
-        if slen - i >= mlen {
-            if x == motif_rev {
-                score += 1;
-            } else {
-                score = 0;
-            }
-            if score > max_score {
-                max_score = score;
-                max_i = Some(i);
-            }
+        if i >= mlen {
+            score += if hit { 1 } else { -penalty };
+        }
+        if score > max_score {
+            max_score = score;
+            max_i = i as isize;
+        } else if max_score - score > max_drop as i64 {
+            break;
         }
     }
 
-    if let Some(i) = max_i {
-        sum_telo += (slen - i) as u64;
+    let mut st = 0;
+    if max_score >= min_score as i64 {
+        sum_telo += ((max_i + 1) as u64) << 32;
+        st = (max_i + 1) as usize;
+    }
+
+    // Check 3' end
+    score = 0;
+    max_score = 0;
+    max_i = -1;
+    x = 0;
+    l = 0;
+
+    for (i, c) in sequence.chars().rev().take(slen - st).enumerate() {
+        let nt = SEQ_NT6_TABLE[c as usize];
+        let hit = if (1..=4).contains(&nt) {
+            x = ((x << 2) | (4 - nt) as u64) & mask;
+            l += 1;
+            l >= mlen && mtab.contains(&x)
+        } else {
+            l = 0;
+            x = 0;
+            false
+        };
+
+        if i >= mlen {
+            score += if hit { 1 } else { -penalty };
+        }
+        if score > max_score {
+            max_score = score;
+            max_i = i as isize;
+        } else if max_score - score > max_drop as i64 {
+            break;
+        }
+    }
+
+    if max_score >= min_score as i64 {
+        sum_telo += (slen - (max_i as usize)) as u64;
     }
 
     sum_telo
 }
 
-pub fn telo_finder<P: AsRef<std::path::Path>>(
-    fasta_file: P,
-    motif: Option<&str>,
+pub fn telo_finder<P: AsRef<Path>>(
+    fasta_path: P,
+    custom_motif: Option<&str>,
     mut output: Option<&mut dyn Write>,
-) -> std::io::Result<()> {
-    let motif = motif.unwrap_or("TTAGGG").to_string();
+) -> io::Result<Vec<(bool, bool)>> {
+    let sdict = SequenceDict::from_fasta(fasta_path)?;
+    let nseq = sdict.sequences.len();
+    let mut telo_ends = vec![(false, false); nseq];
 
-    let mut fasta = BufReader::new(File::open(fasta_file)?);
-    let mut line = String::new();
-    let mut name = String::new();
-    let mut seq = String::new();
+    let motifs = if let Some(motif) = custom_motif {
+        if !check_motif(motif) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid motif characters",
+            ));
+        }
+        vec![motif]
+    } else {
+        TELO_MOTIF_DB.to_vec()
+    };
 
-    while fasta.read_line(&mut line)? > 0 {
-        let trimmed = line.trim();
-        if trimmed.starts_with('>') {
-            if !seq.is_empty() {
-                let telo = telo_finder_core(&seq, &motif);
-                if telo > 0 {
-                    if let Some(w) = output.as_deref_mut() {
-                        writeln!(w, "{}\t{}\t{}\t{}", name, telo >> 32, telo & 0xffffffff, motif)?;
-                    } else {
-                        println!("{}\t{}\t{}\t{}", name, telo >> 32, telo & 0xffffffff, motif);
-                    }
+    for motif in motifs {
+        let mlen = motif.len();
+        let mut mtab = HashSet::new();
+
+        // Generate all rotations of the motif
+        for i in 0..mlen {
+            let mut x = 0u64;
+            for j in 0..mlen {
+                let c = SEQ_NT6_TABLE[motif.as_bytes()[(i + j) % mlen] as usize];
+                assert!((1..=4).contains(&c));
+                x = (x << 2) | (c - 1) as u64;
+            }
+            mtab.insert(x);
+        }
+
+        for (i, seq) in sdict.sequences.iter().enumerate() {
+            let telo = telo_finder_core(
+                &seq.seq,
+                &mtab,
+                mlen,
+                TELO_PENALTY,
+                TELO_MAX_DROP,
+                TELO_MIN_SCORE,
+            );
+
+            if telo == 0 {
+                continue;
+            }
+
+            if (telo >> 32) > 0 {
+                telo_ends[i].0 = true;
+                if let Some(out) = output.as_mut() {
+                    writeln!(
+                        out,
+                        "{}\t0\t{}\t{}",
+                        seq.name,
+                        (telo >> 32) as u32,
+                        motif
+                    )?;
+                } else {
+                    eprintln!(
+                        "[INFO] found telo motif {} in sequence {} 5'-end up to position {}",
+                        motif,
+                        seq.name,
+                        (telo >> 32) as u32
+                    );
                 }
-                seq.clear();
             }
-            name = trimmed[1..].to_string();
-        } else {
-            seq.push_str(trimmed);
+
+            if (telo as u32) > 0 {
+                telo_ends[i].1 = true;
+                if let Some(out) = output.as_mut() {
+                    writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}",
+                        seq.name,
+                        seq.seq.len() - (telo as u32) as usize,
+                        seq.seq.len(),
+                        motif
+                    )?;
+                } else {
+                    eprintln!(
+                        "[INFO] found telo motif {} in sequence {} 3'-end from position {}",
+                        motif,
+                        seq.name,
+                        seq.seq.len() - (telo as u32) as usize
+                    );
+                }
+            }
         }
-        line.clear();
     }
 
-    if !seq.is_empty() {
-        let telo = telo_finder_core(&seq, &motif);
-        if telo > 0 {
-            if let Some(w) = output.as_deref_mut() {
-                writeln!(w, "{}\t{}\t{}\t{}", name, telo >> 32, telo & 0xffffffff, motif)?;
-            } else {
-                println!("{}\t{}\t{}\t{}", name, telo >> 32, telo & 0xffffffff, motif);
-            }
-        }
-    }
-
-    Ok(())
+    Ok(telo_ends)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
 
-fn main() -> std::io::Result<()> {
+    #[test]
+    fn test_check_motif() {
+        assert!(check_motif("AACCCT"));
+        assert!(!check_motif("AANCC")); // Contains N which is invalid
+    }
+
+    #[test]
+    fn test_telo_finder_core() {
+        let motif = "AACCCT";
+        let mlen = motif.len();
+        let mut mtab = HashSet::new();
+
+        // Generate all rotations
+        for i in 0..mlen {
+            let mut x = 0u64;
+            for j in 0..mlen {
+                let c = SEQ_NT6_TABLE[motif.as_bytes()[(i + j) % mlen] as usize];
+                x = (x << 2) | (c - 1) as u64;
+            }
+            mtab.insert(x);
+        }
+
+        let seq = "AACCCTAACCCTAACCCTGGG";
+        let result = telo_finder_core(seq, &mtab, mlen, 1, 2000, 300);
+        assert_ne!(result, 0);
+    }
+}
+
+fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <fasta_file> [motif]", args[0]);
         std::process::exit(1);
     }
 
-    let motif = if args.len() >= 3 { Some(&args[2][..]) } else { None };
-    telo_finder(&args[1], motif, None)
+    let custom_motif = if args.len() > 2 {
+        Some(args[2].as_str())
+    } else {
+        None
+    };
+
+    let mut output = io::stdout();
+    let _ = telo_finder(&args[1], custom_motif, Some(&mut output))?;
+    
+    Ok(())
 }
