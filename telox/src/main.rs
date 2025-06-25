@@ -2,12 +2,16 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::env;
+use anyhow::{Context, Result};
+mod kmers;
+use kmers::{count_kmers_in_fasta, print_kmer_table, save_kmer_table, analyze_strand_bias, print_strand_bias_table, save_strand_bias_table, get_strand_bias_summary, longest_continuous_stretch_for_kmers, filter_strand_bias_tsvs, consolidate_rotational_kmers};
 
 // Constants
 const TELO_PENALTY: i64 = 1;
 const TELO_MAX_DROP: i64 = 2000;
 const TELO_MIN_SCORE: i64 = 300;
-static TELO_MOTIF_DB: &[&str] = &[
+/*static TELO_MOTIF_DB: &[&str] = &[
     "AAAATTGTCCGTCC",
     "AAACCACCCT",
     "AAACCC",
@@ -31,6 +35,30 @@ static TELO_MOTIF_DB: &[&str] = &[
     "ACCCAG",
     "ACCTG",
     "ACGGCAGCG",
+];*/
+
+static TELO_MOTIF_DB: &[&str] = &[
+"CCTAA",
+"AATTC",
+"TTAGG",
+"GCCTAA",
+"TTAGGC",
+"CCACAA",
+"TTGTGG",
+"CCCTAA",
+"TTAGGG",
+"TGCAA",
+"TTGCA",
+"CCCCAAAA",
+"TTTTGGGG",
+"CCCTAAAA",
+"TTTTAGGG",
+"CCCTA",
+"TAGGG",
+"CAATCGTCC",
+"GGACGATTG",
+"ACACCAGT",
+"ACTGGTGT",
 ];
 
 // Nucleotide table (similar to seq_nt6_table)
@@ -328,21 +356,70 @@ mod tests {
     }
 }
 
-fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <fasta_file> [motif]", args[0]);
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() != 2 {
+        eprintln!("Usage: {} <fasta_file>", args[0]);
+        eprintln!("Example: {} genome.fasta", args[0]);
         std::process::exit(1);
     }
 
-    let custom_motif = if args.len() > 2 {
-        Some(args[2].as_str())
-    } else {
-        None
-    };
+    let fasta_path = args[1].clone();
 
-    let mut output = io::stdout();
-    let _ = telo_finder(&args[1], custom_motif, Some(&mut output))?;
-    
+    for k in 5..=15 {
+        let counts = count_kmers_in_fasta(&fasta_path, k)
+            .with_context(|| format!("Failed to count {}-mers in {}", k, fasta_path))?;
+
+        let output_filename = format!("kmer_counts_{}mer.tsv", k);
+        save_kmer_table(&counts, &output_filename)
+            .with_context(|| format!("Failed to save results to {}", output_filename))?;
+
+        // Compute longest stretch for each k-mer across all sequences (last 5000 bp only)
+        let sdict = SequenceDict::from_fasta(&fasta_path)?;
+        let mut longest_stretch_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let kmer_list: Vec<String> = counts.keys().cloned().collect();
+        for seq in &sdict.sequences {
+            let seq_slice = if seq.seq.len() > 5000 {
+                &seq.seq[seq.seq.len() - 5000..]
+            } else {
+                &seq.seq
+            };
+            let stretch_map = longest_continuous_stretch_for_kmers(seq_slice, &kmer_list);
+            for (kmer, stretch) in stretch_map {
+                let entry = longest_stretch_map.entry(kmer).or_insert(0);
+                if stretch > *entry {
+                    *entry = stretch;
+                }
+            }
+        }
+
+        // Strand bias analysis
+        let bias_analyses = analyze_strand_bias(&counts, Some(&longest_stretch_map));
+        
+        // Save strand bias results
+        let bias_output_filename = format!("strand_bias_{}mer.tsv", k);
+        let mut content = String::new();
+        content.push_str("Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\tLongestStretch\n");
+        for analysis in &bias_analyses {
+            let ratio_str = if analysis.bias_ratio == f64::INFINITY {
+                "inf".to_string()
+            } else {
+                format!("{:.3}", analysis.bias_ratio)
+            };
+            content.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                analysis.kmer,
+                analysis.forward_count,
+                analysis.rc_count,
+                analysis.total_count,
+                ratio_str,
+                analysis.bias_direction,
+                analysis.significance,
+                analysis.longest_stretch
+            ));
+        }
+        std::fs::write(&bias_output_filename, content)?;
+    }
+
     Ok(())
 }
