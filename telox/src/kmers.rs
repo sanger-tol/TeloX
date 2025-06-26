@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use csv::{ReaderBuilder, WriterBuilder};
+use rayon::prelude::*;
 
 #[derive(Debug)]
 pub struct KmerPair {
@@ -131,6 +132,24 @@ pub fn longest_continuous_stretch_for_kmers(
     run_map.into_iter().map(|(k, (_cur, max))| (k, max)).collect()
 }
 
+fn is_homopolymer_bytes(seq: &[u8]) -> bool {
+    if seq.is_empty() {
+        return false;
+    }
+    let first = seq[0];
+    seq.iter().all(|&c| c == first)
+}
+
+fn g_content_bytes(seq: &[u8]) -> f64 {
+    let g_count = seq.iter().filter(|&&c| c == b'G' || c == b'g').count();
+    g_count as f64 / seq.len() as f64
+}
+
+fn c_content_bytes(seq: &[u8]) -> f64 {
+    let c_count = seq.iter().filter(|&&c| c == b'C' || c == b'c').count();
+    c_count as f64 / seq.len() as f64
+}
+
 pub fn count_kmers_in_fasta(
     fasta_path: impl AsRef<Path>,
     k: usize,
@@ -139,61 +158,63 @@ pub fn count_kmers_in_fasta(
         return Err(anyhow!("k must be greater than 0"));
     }
 
-    let mut counts = HashMap::new();
+    use std::collections::HashMap as StdHashMap;
+    let mut counts: StdHashMap<Vec<u8>, KmerPair> = StdHashMap::new();
     let mut reader = parse_fastx_file(fasta_path)?;
-
     while let Some(record) = reader.next() {
         let seqrec = record?;
         seqrec.normalize(true);
-        
         let seq_len = seqrec.seq().len();
         let min_pos = if seq_len > 5000 { seq_len - 5000 } else { 0 };
-
         for (pos, kmer) in seqrec.kmers(k as u8).enumerate() {
-            // Filter: only count k-mers in the last 5kbp if scaffold > 5kb
             if pos < min_pos {
                 continue;
             }
-
-            let forward = String::from_utf8(kmer.to_vec())?;
-            let rc = String::from_utf8(kmer.reverse_complement().to_vec())?;
-
-            // Filter 1: skip if k-mer contains 'N'
-            if forward.contains('N') || rc.contains('N') {
+            let forward = kmer.to_vec();
+            let rc = kmer.reverse_complement().to_vec();
+            if forward.contains(&b'N') || rc.contains(&b'N') {
                 continue;
             }
-
-            // Filter 2: skip homopolymers
-            if is_homopolymer(&forward) {
+            if is_homopolymer_bytes(&forward) {
                 continue;
             }
-
-            // Filter: skip if k-mer contains whitespace
-            if forward.chars().any(|c| c.is_whitespace()) || rc.chars().any(|c| c.is_whitespace()) {
+            if forward.iter().any(|&c| c.is_ascii_whitespace()) || rc.iter().any(|&c| c.is_ascii_whitespace()) {
                 continue;
             }
-
-            // Filter 3: at least one of G-content or C-content > 0.28 in either strand
-            if !(g_content(&forward) > 0.28 || c_content(&forward) > 0.28 || g_content(&rc) > 0.28 || c_content(&rc) > 0.28) {
+            if !(g_content_bytes(&forward) > 0.28 ||
+                 c_content_bytes(&forward) > 0.28 ||
+                 g_content_bytes(&rc) > 0.28 ||
+                 c_content_bytes(&rc) > 0.28) {
                 continue;
             }
-
-            // Determine canonical form
-            let canonical = std::cmp::min(forward.clone(), rc.clone());
-            let entry = counts.entry(canonical).or_insert(KmerPair { forward: 0, rc: 0 });
-
-            if forward < rc {
-                entry.forward += 1;
+            let (canonical, is_forward) = if forward < rc {
+                (forward.clone(), true)
             } else if rc < forward {
-                entry.rc += 1;
+                (rc.clone(), false)
             } else {
+                (forward.clone(), true) // palindromic, treat as forward
+            };
+            let entry = counts.entry(canonical).or_insert(KmerPair { forward: 0, rc: 0 });
+            if forward == rc {
                 entry.forward += 1;
+                entry.rc += 1;
+            } else if is_forward {
+                entry.forward += 1;
+            } else {
                 entry.rc += 1;
             }
         }
     }
-
-    Ok(counts)
+    // Convert Vec<u8> keys to String for output
+    let final_counts: HashMap<String, KmerPair> = counts.into_iter()
+        .filter_map(|(kmer, pair)| {
+            match String::from_utf8(kmer) {
+                Ok(s) => Some((s, pair)),
+                Err(_) => None,
+            }
+        })
+        .collect();
+    Ok(final_counts)
 }
 
 pub fn print_kmer_table(counts: &HashMap<String, KmerPair>, top_n: usize) {
@@ -371,6 +392,7 @@ pub fn get_strand_bias_summary(analyses: &[StrandBiasAnalysis]) -> (usize, usize
 
 /// Filter multiple strand bias TSV files by LongestStretch >= 2 and Significance != "weak".
 /// Writes all passing rows to a single output file, with header only once.
+
 pub fn filter_strand_bias_tsvs(input_files: &[&str], output_file: &str) -> Result<()> {
     let mut writer = WriterBuilder::new()
         .delimiter(b'\t')
@@ -428,4 +450,12 @@ pub fn consolidate_rotational_kmers(kmers: &[String]) -> Vec<String> {
         }
     }
     result
+}
+
+/// Filter bias analyses to keep only those with longest_stretch >= 2 and significance != "weak".
+pub fn filter_bias_analyses<'a>(analyses: &'a [StrandBiasAnalysis]) -> Vec<&'a StrandBiasAnalysis> {
+    analyses
+        .iter()
+        .filter(|a| a.longest_stretch >= 2 && a.significance != "weak")
+        .collect()
 }
