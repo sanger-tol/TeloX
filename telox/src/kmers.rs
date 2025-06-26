@@ -6,6 +6,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use csv::{ReaderBuilder, WriterBuilder};
 use rayon::prelude::*;
+use hashbrown::HashMap as Hm;
+use ahash::RandomState;
 
 #[derive(Debug)]
 pub struct KmerPair {
@@ -150,6 +152,24 @@ fn c_content_bytes(seq: &[u8]) -> f64 {
     c_count as f64 / seq.len() as f64
 }
 
+fn is_dinucleotide_repeat_bytes(seq: &[u8]) -> bool {
+    let len = seq.len();
+    if len < 4 || len % 2 != 0 {
+        return false;
+    }
+    let first = seq[0];
+    let second = seq[1];
+    if first == second {
+        return false; // not a dinucleotide repeat if both are the same
+    }
+    for i in (0..len).step_by(2) {
+        if seq[i] != first || seq[i + 1] != second {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn count_kmers_in_fasta(
     fasta_path: impl AsRef<Path>,
     k: usize,
@@ -157,9 +177,11 @@ pub fn count_kmers_in_fasta(
     if k == 0 {
         return Err(anyhow!("k must be greater than 0"));
     }
+    if k > 32 {
+        return Err(anyhow!("k must be <= 32 for fixed-size array optimization"));
+    }
 
-    use std::collections::HashMap as StdHashMap;
-    let mut counts: StdHashMap<Vec<u8>, KmerPair> = StdHashMap::new();
+    let mut counts: Hm<[u8; 32], KmerPair, RandomState> = Hm::with_hasher(RandomState::new());
     let mut reader = parse_fastx_file(fasta_path)?;
     while let Some(record) = reader.next() {
         let seqrec = record?;
@@ -170,32 +192,39 @@ pub fn count_kmers_in_fasta(
             if pos < min_pos {
                 continue;
             }
-            let forward = kmer.to_vec();
-            let rc = kmer.reverse_complement().to_vec();
-            if forward.contains(&b'N') || rc.contains(&b'N') {
+            let mut forward = [0u8; 32];
+            let mut rc = [0u8; 32];
+            let kmer_vec = kmer.to_vec();
+            let rc_vec = kmer.reverse_complement().to_vec();
+            forward[..k].copy_from_slice(&kmer_vec);
+            rc[..k].copy_from_slice(&rc_vec);
+            if forward[..k].contains(&b'N') || rc[..k].contains(&b'N') {
                 continue;
             }
-            if is_homopolymer_bytes(&forward) {
+            if is_homopolymer_bytes(&forward[..k]) {
                 continue;
             }
-            if forward.iter().any(|&c| c.is_ascii_whitespace()) || rc.iter().any(|&c| c.is_ascii_whitespace()) {
+            if is_dinucleotide_repeat_bytes(&forward[..k]) {
                 continue;
             }
-            if !(g_content_bytes(&forward) > 0.28 ||
-                 c_content_bytes(&forward) > 0.28 ||
-                 g_content_bytes(&rc) > 0.28 ||
-                 c_content_bytes(&rc) > 0.28) {
+            if forward[..k].iter().any(|&c| c.is_ascii_whitespace()) || rc[..k].iter().any(|&c| c.is_ascii_whitespace()) {
                 continue;
             }
-            let (canonical, is_forward) = if forward < rc {
-                (forward.clone(), true)
-            } else if rc < forward {
-                (rc.clone(), false)
+            if !(g_content_bytes(&forward[..k]) > 0.28 ||
+                 c_content_bytes(&forward[..k]) > 0.28 ||
+                 g_content_bytes(&rc[..k]) > 0.28 ||
+                 c_content_bytes(&rc[..k]) > 0.28) {
+                continue;
+            }
+            let (canonical, is_forward) = if forward[..k] < rc[..k] {
+                (forward, true)
+            } else if rc[..k] < forward[..k] {
+                (rc, false)
             } else {
-                (forward.clone(), true) // palindromic, treat as forward
+                (forward, true) // palindromic, treat as forward
             };
             let entry = counts.entry(canonical).or_insert(KmerPair { forward: 0, rc: 0 });
-            if forward == rc {
+            if forward[..k] == rc[..k] {
                 entry.forward += 1;
                 entry.rc += 1;
             } else if is_forward {
@@ -205,11 +234,11 @@ pub fn count_kmers_in_fasta(
             }
         }
     }
-    // Convert Vec<u8> keys to String for output
+    // Convert [u8; 32] keys to String for output
     let final_counts: HashMap<String, KmerPair> = counts.into_iter()
         .filter_map(|(kmer, pair)| {
-            match String::from_utf8(kmer) {
-                Ok(s) => Some((s, pair)),
+            match std::str::from_utf8(&kmer[..k]) {
+                Ok(s) => Some((s.to_string(), pair)),
                 Err(_) => None,
             }
         })

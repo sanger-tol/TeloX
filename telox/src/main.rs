@@ -367,13 +367,9 @@ fn main() -> Result<()> {
 
     let fasta_path = args[1].clone();
 
-    for k in 5..=15 {
+    for k in 5..=12 {
         let counts = count_kmers_in_fasta(&fasta_path, k)
             .with_context(|| format!("Failed to count {}-mers in {}", k, fasta_path))?;
-
-        let output_filename = format!("kmer_counts_{}mer.tsv", k);
-        save_kmer_table(&counts, &output_filename)
-            .with_context(|| format!("Failed to save results to {}", output_filename))?;
 
         // Compute longest stretch for each k-mer across all sequences (last 5000 bp only)
         let sdict = SequenceDict::from_fasta(&fasta_path)?;
