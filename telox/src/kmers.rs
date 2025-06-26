@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use anyhow::{anyhow, Result};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use csv::{ReaderBuilder, WriterBuilder};
 use rayon::prelude::*;
 use hashbrown::HashMap as Hm;
 use ahash::RandomState;
+use std::process::Command;
 
 #[derive(Debug)]
 pub struct KmerPair {
@@ -265,33 +266,6 @@ pub fn print_kmer_table(counts: &HashMap<String, KmerPair>, top_n: usize) {
     }
 }
 
-pub fn save_kmer_table(counts: &HashMap<String, KmerPair>, output_path: &str) -> Result<()> {
-    let mut entries: Vec<_> = counts.iter().collect();
-
-    // Sort by total count (forward + rc), descending
-    entries.sort_by(|a, b| {
-        let total_a = a.1.forward + a.1.rc;
-        let total_b = b.1.forward + b.1.rc;
-        total_b.cmp(&total_a)
-    });
-
-    let content = entries.iter()
-        .map(|(kmer, counts)| {
-            format!(
-                "{}\t{}\t{}\t{}",
-                kmer,
-                counts.forward + counts.rc,
-                counts.forward,
-                counts.rc
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    std::fs::write(output_path, content)?;
-    Ok(())
-}
-
 pub fn analyze_strand_bias(
     counts: &HashMap<String, KmerPair>,
     longest_stretch_map: Option<&HashMap<String, usize>>,
@@ -487,4 +461,107 @@ pub fn filter_bias_analyses<'a>(analyses: &'a [StrandBiasAnalysis]) -> Vec<&'a S
         .iter()
         .filter(|a| a.longest_stretch >= 2 && a.significance != "weak")
         .collect()
+}
+
+/// Run KMC to count k-mers from a FASTA file
+pub fn run_kmc(input_fasta: &str, k: usize, db_prefix: &str) -> std::io::Result<()> {
+    let status = Command::new("kmc")
+        .args(&[
+            format!("-k{}", k),
+            "-ci1".to_string(),
+            "-cs1000000".to_string(),
+            "-fm".to_string(),
+            input_fasta.to_string(),
+            db_prefix.to_string(),
+            ".".to_string(),
+        ])
+        .status()?;
+    if !status.success() {
+        panic!("KMC failed with exit code: {:?}", status.code());
+    }
+    Ok(())
+}
+
+/// Run kmc_dump to export KMC results to a text file
+pub fn run_kmc_dump(db_prefix: &str, output_txt: &str) -> std::io::Result<()> {
+    let status = Command::new("kmc_dump")
+        .args(&[db_prefix, output_txt])
+        .status()?;
+    if !status.success() {
+        panic!("kmc_dump failed with exit code: {:?}", status.code());
+    }
+    Ok(())
+}
+
+/// Read dumped KMC k-mer counts from a text file
+pub fn read_kmc_counts(path: &str) -> std::io::Result<Vec<(String, u64)>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut kmers = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let mut parts = line.split_whitespace();
+        if let (Some(kmer), Some(count)) = (parts.next(), parts.next()) {
+            if let Ok(count) = count.parse() {
+                kmers.push((kmer.to_string(), count));
+            }
+        }
+    }
+    Ok(kmers)
+}
+
+/// Full pipeline: run KMC, dump, and load k-mer counts
+pub fn kmc_pipeline(input_fasta: &str, k: usize, db_prefix: &str, output_txt: &str) -> std::io::Result<Vec<(String, u64)>> {
+    run_kmc(input_fasta, k, db_prefix)?;
+    run_kmc_dump(db_prefix, output_txt)?;
+    read_kmc_counts(output_txt)
+}
+
+/// Filter and analyze k-mers loaded from KMC output, applying biological filters and bias analysis.
+pub fn analyze_kmc_kmers(
+    kmers: Vec<(String, u64)>,
+    k: usize,
+) -> Vec<StrandBiasAnalysis> {
+    use std::collections::HashMap;
+    let mut canonical_counts: HashMap<String, KmerPair> = HashMap::new();
+
+    for (kmer, count) in kmers {
+        if kmer.len() != k {
+            continue;
+        }
+        let rc = reverse_complement(&kmer);
+        let (canonical, is_forward) = if kmer < rc {
+            (kmer.clone(), true)
+        } else {
+            (rc.clone(), false)
+        };
+
+        // Apply filters to canonical k-mer
+        if canonical.contains('N') || reverse_complement(&canonical).contains('N') {
+            continue;
+        }
+        if is_homopolymer(&canonical) {
+            continue;
+        }
+        if is_dinucleotide_repeat_bytes(canonical.as_bytes()) {
+            continue;
+        }
+        if canonical.chars().any(|c| c.is_whitespace()) || reverse_complement(&canonical).chars().any(|c| c.is_whitespace()) {
+            continue;
+        }
+        if !(g_content(&canonical) > 0.28 || c_content(&canonical) > 0.28 ||
+             g_content(&reverse_complement(&canonical)) > 0.28 ||
+             c_content(&reverse_complement(&canonical)) > 0.28) {
+            continue;
+        }
+
+        let entry = canonical_counts.entry(canonical).or_insert(KmerPair { forward: 0, rc: 0 });
+        if is_forward {
+            entry.forward += count as u32;
+        } else {
+            entry.rc += count as u32;
+        }
+    }
+
+    analyze_strand_bias(&canonical_counts, None)
 }

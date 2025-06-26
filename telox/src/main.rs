@@ -5,7 +5,7 @@ use std::path::Path;
 use std::env;
 use anyhow::{Context, Result};
 mod kmers;
-use kmers::{count_kmers_in_fasta, print_kmer_table, save_kmer_table, analyze_strand_bias, print_strand_bias_table, save_strand_bias_table, get_strand_bias_summary, longest_continuous_stretch_for_kmers, filter_strand_bias_tsvs, consolidate_rotational_kmers};
+use kmers::{count_kmers_in_fasta, print_kmer_table, analyze_strand_bias, print_strand_bias_table, save_strand_bias_table, get_strand_bias_summary, longest_continuous_stretch_for_kmers, filter_strand_bias_tsvs, consolidate_rotational_kmers};
 
 // Constants
 const TELO_PENALTY: i64 = 1;
@@ -368,20 +368,21 @@ fn main() -> Result<()> {
     let fasta_path = args[1].clone();
 
     for k in 5..=12 {
-        let counts = count_kmers_in_fasta(&fasta_path, k)
-            .with_context(|| format!("Failed to count {}-mers in {}", k, fasta_path))?;
+        // Use Rust k-mer counting for last 5000bp of each scaffold
+        let counts = kmers::count_kmers_in_fasta(&fasta_path, k)
+            .with_context(|| format!("Failed to count {}-mers in {}", k, &fasta_path))?;
 
-        // Compute longest stretch for each k-mer across all sequences (last 5000 bp only)
+        // Calculate longest stretch for each k-mer using the original FASTA
         let sdict = SequenceDict::from_fasta(&fasta_path)?;
-        let mut longest_stretch_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let kmer_list: Vec<String> = counts.keys().cloned().collect();
+        let mut longest_stretch_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for seq in &sdict.sequences {
             let seq_slice = if seq.seq.len() > 5000 {
                 &seq.seq[seq.seq.len() - 5000..]
             } else {
                 &seq.seq
             };
-            let stretch_map = longest_continuous_stretch_for_kmers(seq_slice, &kmer_list);
+            let stretch_map = kmers::longest_continuous_stretch_for_kmers(seq_slice, &kmer_list);
             for (kmer, stretch) in stretch_map {
                 let entry = longest_stretch_map.entry(kmer).or_insert(0);
                 if stretch > *entry {
@@ -389,10 +390,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-
         // Strand bias analysis
-        let bias_analyses = analyze_strand_bias(&counts, Some(&longest_stretch_map));
-        
+        let mut bias_analyses = kmers::analyze_strand_bias(&counts, Some(&longest_stretch_map));
         // Save strand bias results
         let bias_output_filename = format!("strand_bias_{}mer.tsv", k);
         let mut content = String::new();
