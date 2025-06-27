@@ -1,3 +1,27 @@
+/*
+ * TeloX - Telomere Motif Extraction Tool
+ *
+ * Copyright (c) 2025 Yumi Sims, Wellcome Sanger Institute
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, Write};
@@ -5,7 +29,7 @@ use std::path::Path;
 use std::env;
 use anyhow::{Context, Result};
 mod kmers;
-use kmers::{count_kmers_in_fasta, print_kmer_table, analyze_strand_bias, print_strand_bias_table, save_strand_bias_table, get_strand_bias_summary, longest_continuous_stretch_for_kmers, filter_strand_bias_tsvs, consolidate_rotational_kmers};
+use kmers::{count_kmers_in_fasta, print_kmer_table, analyze_strand_bias, print_strand_bias_table, save_strand_bias_table, get_strand_bias_summary, longest_continuous_stretch_for_kmers, filter_strand_bias_tsvs, consolidate_rotational_kmers, extract_last_n_bp_to_fasta};
 
 // Constants
 const TELO_PENALTY: i64 = 1;
@@ -231,21 +255,24 @@ pub fn telo_finder<P: AsRef<Path>>(
     fasta_path: P,
     custom_motif: Option<&str>,
     mut output: Option<&mut dyn Write>,
+    motif_list: Option<&[String]>,
 ) -> io::Result<Vec<(bool, bool)>> {
     let sdict = SequenceDict::from_fasta(fasta_path)?;
     let nseq = sdict.sequences.len();
     let mut telo_ends = vec![(false, false); nseq];
 
-    let motifs = if let Some(motif) = custom_motif {
+    let motifs: Vec<String> = if let Some(motif_list) = motif_list {
+        motif_list.to_vec()
+    } else if let Some(motif) = custom_motif {
         if !check_motif(motif) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Invalid motif characters",
             ));
         }
-        vec![motif]
+        vec![motif.to_string()]
     } else {
-        TELO_MOTIF_DB.to_vec()
+        TELO_MOTIF_DB.iter().map(|s| s.to_string()).collect()
     };
 
     for motif in motifs {
@@ -359,30 +386,66 @@ mod tests {
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() != 2 {
-        eprintln!("Usage: {} <fasta_file>", args[0]);
+    if args.len() < 2 {
+        eprintln!("Usage: {} <fasta_file> [extract_lastN <N> <output_fasta>]", args[0]);
+        eprintln!("       {} kmc <input_fasta> <k> <db_prefix> <output_txt>", args[0]);
         eprintln!("Example: {} genome.fasta", args[0]);
+        eprintln!("         {} genome.fasta extract_lastN 5000 last5000.fasta", args[0]);
+        eprintln!("         {} kmc last5000.fasta 7 kmc_db kmc_dump.txt", args[0]);
         std::process::exit(1);
+    }
+
+    // KMC canonicalization pipeline
+    if args.len() == 6 && args[1] == "kmc" {
+        let input_fasta = &args[2];
+        let k: usize = args[3].parse().expect("k must be an integer");
+        let db_prefix = &args[4];
+        let output_txt = &args[5];
+        // Run KMC and dump
+        kmers::run_kmc(input_fasta, k, db_prefix)?;
+        kmers::run_kmc_dump(db_prefix, output_txt)?;
+        // Read and canonicalize
+        let kmc_counts = kmers::read_kmc_counts(output_txt)?;
+        let analyses = kmers::analyze_kmc_kmers(kmc_counts, k);
+        // Save canonicalized k-mer table
+        let mut file = std::fs::File::create("canonical_kmers.tsv")?;
+        writeln!(file, "Kmer\tForward\tRC\tTotal")?;
+        for a in &analyses {
+            writeln!(file, "{}\t{}\t{}\t{}", a.kmer, a.forward_count, a.rc_count, a.total_count)?;
+        }
+        println!("Saved canonicalized k-mer table to canonical_kmers.tsv ({} k-mers)", analyses.len());
+        return Ok(());
     }
 
     let fasta_path = args[1].clone();
 
-    for k in 5..=12 {
-        // Use Rust k-mer counting for last 5000bp of each scaffold
-        let counts = kmers::count_kmers_in_fasta(&fasta_path, k)
-            .with_context(|| format!("Failed to count {}-mers in {}", k, &fasta_path))?;
+    // Optionally extract last N bp to a new FASTA file
+    if args.len() == 5 && args[2] == "extract_lastN" {
+        let n: usize = args[3].parse().expect("N must be an integer");
+        let output_fasta = &args[4];
+        extract_last_n_bp_to_fasta(&fasta_path, output_fasta, n)?;
+        println!("Extracted last {} bp of each scaffold to {}", n, output_fasta);
+        return Ok(());
+    }
 
-        // Calculate longest stretch for each k-mer using the original FASTA
+    for k in 5..=12 {
+        println!("Processing {}-mers...", k);
+        
+        // Use optimized k-mer counting for last 5000bp of each scaffold
+        let counts = kmers::count_kmers_last_5000bp_parallel(&fasta_path, k)
+            .with_context(|| format!("Failed to count {}-mers in last 5000bp of {}", k, &fasta_path))?;
+
+        // Calculate longest stretch for each k-mer using only the last 5000bp of each scaffold
         let sdict = SequenceDict::from_fasta(&fasta_path)?;
         let kmer_list: Vec<String> = counts.keys().cloned().collect();
         let mut longest_stretch_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for seq in &sdict.sequences {
-            let seq_slice = if seq.seq.len() > 5000 {
-                &seq.seq[seq.seq.len() - 5000..]
+            let region = if seq.seq.len() <= 5000 {
+                &seq.seq[..]
             } else {
-                &seq.seq
+                &seq.seq[seq.seq.len() - 5000..]
             };
-            let stretch_map = kmers::longest_continuous_stretch_for_kmers(seq_slice, &kmer_list);
+            let stretch_map = kmers::longest_continuous_stretch_for_kmers(region, &kmer_list);
             for (kmer, stretch) in stretch_map {
                 let entry = longest_stretch_map.entry(kmer).or_insert(0);
                 if stretch > *entry {
@@ -390,8 +453,17 @@ fn main() -> Result<()> {
                 }
             }
         }
+        
         // Strand bias analysis
         let mut bias_analyses = kmers::analyze_strand_bias(&counts, Some(&longest_stretch_map));
+        
+        // Filter out k-mers with longest stretch < 2 and weak significance
+        let filtered_analyses: Vec<&kmers::StrandBiasAnalysis> = bias_analyses.iter()
+            .filter(|analysis| {
+                analysis.longest_stretch >= 2 && analysis.significance != "weak"
+            })
+            .collect();
+        
         // Save strand bias results
         let bias_output_filename = format!("strand_bias_{}mer.tsv", k);
         let mut content = String::new();
@@ -414,7 +486,52 @@ fn main() -> Result<()> {
             ));
         }
         std::fs::write(&bias_output_filename, content)?;
+        println!("Saved strand bias results to {}", bias_output_filename);
     }
+
+    // Instead of reading filtered files, gather all filtered analyses in memory and rank them
+    let mut all_filtered_analyses = Vec::new();
+    for k in 5..=12 {
+        let bias_output_filename = format!("strand_bias_{}mer.tsv", k);
+        let file = std::fs::File::open(&bias_output_filename)?;
+        let reader = std::io::BufReader::new(file);
+        for (i, line) in reader.lines().enumerate() {
+            let line = line?;
+            if i == 0 || line.trim().is_empty() { continue; }
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() < 8 { continue; }
+            let longest_stretch: usize = cols[7].parse().unwrap_or(0);
+            let significance = cols[6];
+            if longest_stretch < 2 || significance == "weak" { continue; }
+            all_filtered_analyses.push((
+                cols[0].to_string(), // kmer
+                cols[1].parse().unwrap_or(0), // forward
+                cols[2].parse().unwrap_or(0), // rc
+                cols[3].parse().unwrap_or(0), // total
+                cols[4].to_string(), // bias_ratio
+                cols[5].to_string(), // direction
+                cols[6].to_string(), // significance
+                longest_stretch,
+            ));
+        }
+    }
+    // Sort by longest_stretch DESC, then total DESC
+    all_filtered_analyses.sort_by(|a, b| b.7.cmp(&a.7).then(b.3.cmp(&a.3)));
+    // Write to rank.tsv
+    let mut out = std::fs::File::create("rank.tsv")?;
+    writeln!(out, "Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\tLongestStretch")?;
+    for k in all_filtered_analyses {
+        writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", k.0, k.1, k.2, k.3, k.4, k.5, k.6, k.7)?;
+    }
+    println!("Ranked k-mers written to rank.tsv");
+
+    // Consolidate motifs by rotation from rank.tsv
+    let motifs = kmers::consolidate_ranked_motifs_by_rotation("rank.tsv")?;
+    println!("Running telo_finder with {} motifs from rank.tsv rotations...", motifs.len());
+    // Run telo_finder with the new motifs array and print results to anno.txt
+    let mut anno_file = std::fs::File::create("anno.txt")?;
+    let _telo_results = telo_finder(&fasta_path, None, Some(&mut anno_file), Some(&motifs))?;
+    println!("telo_finder completed with motifs from rank.tsv. Results written to anno.txt");
 
     Ok(())
 }
