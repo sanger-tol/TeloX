@@ -35,7 +35,7 @@ use kmers::{count_kmers_in_fasta, print_kmer_table, analyze_strand_bias, print_s
 const TELO_PENALTY: i64 = 1;
 const TELO_MAX_DROP: i64 = 2000;
 const TELO_MIN_SCORE: i64 = 300;
-/*static TELO_MOTIF_DB: &[&str] = &[
+static TELO_MOTIF_DB: &[&str] = &[
     "AAAATTGTCCGTCC",
     "AAACCACCCT",
     "AAACCC",
@@ -59,31 +59,8 @@ const TELO_MIN_SCORE: i64 = 300;
     "ACCCAG",
     "ACCTG",
     "ACGGCAGCG",
-];*/
-
-static TELO_MOTIF_DB: &[&str] = &[
-"CCTAA",
-"AATTC",
-"TTAGG",
-"GCCTAA",
-"TTAGGC",
-"CCACAA",
-"TTGTGG",
-"CCCTAA",
-"TTAGGG",
-"TGCAA",
-"TTGCA",
-"CCCCAAAA",
-"TTTTGGGG",
-"CCCTAAAA",
-"TTTTAGGG",
-"CCCTA",
-"TAGGG",
-"CAATCGTCC",
-"GGACGATTG",
-"ACACCAGT",
-"ACTGGTGT",
 ];
+
 
 // Nucleotide table (similar to seq_nt6_table)
 const SEQ_NT6_TABLE: [u8; 256] = [
@@ -383,6 +360,132 @@ mod tests {
     }
 }
 
+/// Analyze annotation file and report the most frequent telomere motifs
+fn analyze_annotation_file(anno_file: &str) -> Result<Vec<(String, usize)>> {
+    let file = File::open(anno_file)?;
+    let reader = io::BufReader::new(file);
+    let mut motif_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 4 {
+            let motif = parts[3].trim();
+            if !motif.is_empty() {
+                *motif_counts.entry(motif.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    
+    // Sort by frequency (descending)
+    let mut sorted_motifs: Vec<(String, usize)> = motif_counts.into_iter().collect();
+    sorted_motifs.sort_by(|a, b| b.1.cmp(&a.1));
+    
+    Ok(sorted_motifs)
+}
+
+/// Report the most frequent telomere motifs from annotation files
+fn report_most_frequent_motifs(initial_anno_file: &str, final_anno_file: &str) -> Result<()> {
+    println!("\n=== TELOMERE MOTIF FREQUENCY ANALYSIS ===");
+    
+    // Check which annotation file to analyze
+    let (anno_file, source) = if std::path::Path::new(initial_anno_file).exists() {
+        (initial_anno_file, "predefined database")
+    } else if std::path::Path::new(final_anno_file).exists() {
+        (final_anno_file, "discovered database")
+    } else {
+        println!("No annotation files found. No telomere motifs detected.");
+        // Write empty result to telomere_candidate.txt
+        let mut candidate_file = File::create("telomere_candidate.txt")?;
+        writeln!(candidate_file, "No telomere motifs detected in the genome.")?;
+        return Ok(());
+    };
+    
+    println!("Analyzing annotation file: {} (from {})", anno_file, source);
+    
+    let motif_frequencies = analyze_annotation_file(anno_file)?;
+    
+    if motif_frequencies.is_empty() {
+        println!("No telomere motifs found in the annotation file.");
+        // Write empty result to telomere_candidate.txt
+        let mut candidate_file = File::create("telomere_candidate.txt")?;
+        writeln!(candidate_file, "No telomere motifs found in the annotation file.")?;
+        return Ok(());
+    }
+    
+    println!("\nMost frequent telomere motifs:");
+    println!("{:<20} {:<10} {:<10}", "Motif", "Frequency", "Percentage");
+    println!("{}", "-".repeat(40));
+    
+    let total_occurrences: usize = motif_frequencies.iter().map(|(_, count)| count).sum();
+    
+    for (motif, count) in motif_frequencies.iter().take(10) {
+        let percentage = (*count as f64 / total_occurrences as f64) * 100.0;
+        println!("{:<20} {:<10} {:<10.1}%", motif, count, percentage);
+    }
+    
+    if motif_frequencies.len() > 10 {
+        println!("... and {} more motifs", motif_frequencies.len() - 10);
+    }
+    
+    // Report the top motif as the most likely telomere motif
+    if let Some((top_motif, top_count)) = motif_frequencies.first() {
+        let percentage = (*top_count as f64 / total_occurrences as f64) * 100.0;
+        println!("\n=== PRIMARY TELOMERE MOTIF ===");
+        println!("Most frequent motif: {}", top_motif);
+        println!("Occurrences: {} ({:.1}% of all detected motifs)", top_count, percentage);
+        println!("Source: {}", source);
+        
+        // Write the primary telomere motif to telomere_candidate.txt
+        let mut candidate_file = File::create("telomere_candidate.txt")?;
+        writeln!(candidate_file, "PRIMARY TELOMERE MOTIF CANDIDATE")?;
+        writeln!(candidate_file, "=================================")?;
+        writeln!(candidate_file, "Motif: {}", top_motif)?;
+        writeln!(candidate_file, "Frequency: {} occurrences", top_count)?;
+        writeln!(candidate_file, "Percentage: {:.1}% of all detected motifs", percentage)?;
+        writeln!(candidate_file, "Source: {}", source)?;
+        writeln!(candidate_file, "Total motif occurrences: {}", total_occurrences)?;
+        writeln!(candidate_file, "Unique motifs detected: {}", motif_frequencies.len())?;
+        writeln!(candidate_file)?;
+        writeln!(candidate_file, "Top 10 most frequent motifs:")?;
+        writeln!(candidate_file, "{:<20} {:<10} {:<10}", "Motif", "Frequency", "Percentage")?;
+        writeln!(candidate_file, "{}", "-".repeat(40))?;
+        
+        for (motif, count) in motif_frequencies.iter().take(10) {
+            let percentage = (*count as f64 / total_occurrences as f64) * 100.0;
+            writeln!(candidate_file, "{:<20} {:<10} {:<10.1}%", motif, count, percentage)?;
+        }
+        
+        println!("Primary telomere motif written to: telomere_candidate.txt");
+    }
+    
+    // Save detailed results to a file
+    let output_file = "telomere_motif_summary.txt";
+    let mut summary_file = File::create(output_file)?;
+    writeln!(summary_file, "TELOMERE MOTIF FREQUENCY SUMMARY")?;
+    writeln!(summary_file, "=================================")?;
+    writeln!(summary_file, "Source: {}", source)?;
+    writeln!(summary_file, "Annotation file: {}", anno_file)?;
+    writeln!(summary_file, "Total motif occurrences: {}", total_occurrences)?;
+    writeln!(summary_file, "Unique motifs: {}", motif_frequencies.len())?;
+    writeln!(summary_file)?;
+    writeln!(summary_file, "{:<20} {:<10} {:<10}", "Motif", "Frequency", "Percentage")?;
+    writeln!(summary_file, "{}", "-".repeat(40))?;
+    
+    for (motif, count) in &motif_frequencies {
+        let percentage = (*count as f64 / total_occurrences as f64) * 100.0;
+        writeln!(summary_file, "{:<20} {:<10} {:<10.1}%", motif, count, percentage)?;
+    }
+    
+    println!("Detailed summary saved to: {}", output_file);
+    
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -428,6 +531,25 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Step 1: First run telo_finder on TELO_MOTIF_DB
+    println!("Step 1: Running telo_finder with predefined TELO_MOTIF_DB...");
+    let mut initial_anno_file = std::fs::File::create("initial_anno.txt")?;
+    let initial_telo_results = telo_finder(&fasta_path, None, Some(&mut initial_anno_file), None)?;
+    
+    // Check if any telomere motifs were found
+    let found_any_telomeres = initial_telo_results.iter().any(|(five_prime, three_prime)| *five_prime || *three_prime);
+    
+    if found_any_telomeres {
+        println!("Found telomere motifs with predefined database. Results written to initial_anno.txt");
+        println!("Analysis complete.");
+        return Ok(());
+    }
+    
+    println!("No telomere motifs found with predefined database. Proceeding to k-mer analysis...");
+    
+    // Step 2: If no telomeres found, run k-mer analysis to generate new motifs
+    println!("Step 2: Running k-mer analysis to discover potential telomere motifs...");
+    
     for k in 5..=12 {
         println!("Processing {}-mers...", k);
         
@@ -525,13 +647,28 @@ fn main() -> Result<()> {
     }
     println!("Ranked k-mers written to rank.tsv");
 
-    // Consolidate motifs by rotation from rank.tsv
+    // Step 3: Generate new motif array from k-mer analysis and run telo_finder
+    println!("Step 3: Generating new telomere motif database from k-mer analysis...");
     let motifs = kmers::consolidate_ranked_motifs_by_rotation("rank.tsv")?;
-    println!("Running telo_finder with {} motifs from rank.tsv rotations...", motifs.len());
+    println!("Running telo_finder with {} discovered motifs...", motifs.len());
+    
     // Run telo_finder with the new motifs array and print results to anno.txt
     let mut anno_file = std::fs::File::create("anno.txt")?;
-    let _telo_results = telo_finder(&fasta_path, None, Some(&mut anno_file), Some(&motifs))?;
-    println!("telo_finder completed with motifs from rank.tsv. Results written to anno.txt");
+    let final_telo_results = telo_finder(&fasta_path, None, Some(&mut anno_file), Some(&motifs))?;
+    
+    // Check if any telomere motifs were found with the new database
+    let found_any_telomeres_final = final_telo_results.iter().any(|(five_prime, three_prime)| *five_prime || *three_prime);
+    
+    if found_any_telomeres_final {
+        println!("Found telomere motifs with discovered database. Results written to anno.txt");
+    } else {
+        println!("No telomere motifs found even with discovered database.");
+    }
+    
+    println!("Analysis complete.");
+
+    // Report most frequent telomere motifs
+    report_most_frequent_motifs("initial_anno.txt", "anno.txt")?;
 
     Ok(())
 }
