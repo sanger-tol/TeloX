@@ -1,9 +1,10 @@
 # TeloX
 
-**TeloX** (Telomere Motif Extraction Tool) is a high-performance bioinformatics tool for analyzing telomere motifs and k-mers in DNA sequences. It provides comprehensive analysis of strand bias, motif distribution, and telomere identification with optimized performance using parallel processing and efficient algorithms.
+**TeloX** (Telomere Motif Extraction Tool) is a high-performance bioinformatics tool for **de novo identification and analysis of telomere motifs** in DNA sequences. It provides comprehensive analysis of strand bias, motif distribution, and telomere identification with optimized performance using parallel processing and efficient algorithms.
 
 ## Features
 
+- **De novo telomere motif discovery** - Automatically identify novel telomere motifs in species genomes
 - **High-performance k-mer counting** using KMC (K-Mer Counter) for fast processing of large genomes
 - **Strand bias analysis** with statistical significance testing
 - **Telomere motif identification** with customizable motif databases
@@ -170,7 +171,70 @@ TeloX uses a hybrid approach combining:
 - **KMC**: For fast k-mer counting across entire genomes
 - **Rust**: For positional analysis and strand-specific counting in specific regions
 
+## De Novo Telomere Motif Discovery
+
+TeloX excels at **de novo identification** of telomere motifs in species genomes where the telomere sequence is unknown. This is particularly valuable for:
+
+- **Non-model organisms** with unknown telomere sequences
+- **Novel species** where telomere motifs haven't been characterized
+- **Comparative genomics** studies across different taxa
+- **Evolutionary studies** of telomere sequence diversity
+
+### De Novo Discovery Workflow
+
+```bash
+# 1. Perform comprehensive k-mer analysis to identify candidate motifs
+telox --kmer-size 6 --strand-bias genome.fasta
+
+# 2. Filter for significant strand bias patterns
+telox --kmer-size 6 --strand-bias --filter-significant genome.fasta
+
+# 3. Analyze last 5000bp of scaffolds for telomere-enriched regions
+telox --last-5000bp --kmer-size 6 genome.fasta
+
+# 4. Generate filtered results for candidate telomere motifs
+telox --filter-significant --min-stretch 2 genome.fasta
+```
+
+### Identifying Novel Telomere Motifs
+
+TeloX identifies novel telomere motifs by analyzing:
+
+1. **Strand Bias Patterns**: Telomere motifs typically show strong strand bias
+2. **End Enrichment**: Motifs enriched in the last 5000bp of scaffolds
+3. **Continuous Stretches**: Long continuous stretches of motif repeats
+4. **Statistical Significance**: Statistically significant bias ratios
+5. **Motif Conservation**: Consistent patterns across multiple scaffolds
+
+### Example: Discovering Unknown Telomere Motifs
+
+```bash
+# For a species with unknown telomere sequence
+telox --kmer-size 6 --strand-bias --last-5000bp --filter-significant genome.fasta
+
+# This will output candidates like:
+# kmer    forward_count  rc_count  bias_ratio  significance  longest_stretch
+# TTAGGG  1250          45        27.78       strong        15
+# AACCCT  42            1180      0.036       strong        12
+# CCCTAA  1180          42        28.10       strong        12
+```
+
+The top candidates with high bias ratios and long stretches are likely the telomere motifs for that species.
+
 ## Examples
+
+### De Novo Telomere Discovery
+
+```bash
+# Discover telomere motifs in a new species
+telox --kmer-size 6 --strand-bias --last-5000bp --filter-significant new_species.fasta
+
+# Analyze multiple k-mer sizes for comprehensive discovery
+telox --kmer-size 4 --strand-bias --filter-significant new_species.fasta
+telox --kmer-size 5 --strand-bias --filter-significant new_species.fasta
+telox --kmer-size 6 --strand-bias --filter-significant new_species.fasta
+telox --kmer-size 7 --strand-bias --filter-significant new_species.fasta
+```
 
 ### Basic Telomere Analysis
 
