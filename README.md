@@ -275,7 +275,7 @@ telox --last-5000bp --kmer-size 6 genome.fasta
 If you use TeloX in your research, please cite:
 
 ```
-Yumi Sims. TeloX: Telomere Motif Extraction Tool. 
+Yumi Sims, Chenxi Zhou. TeloX: Telomere Motif Extraction Tool. 
 Wellcome Sanger Institute, 2025.
 ```
 
