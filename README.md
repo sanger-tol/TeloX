@@ -221,17 +221,6 @@ telox unknown_species.fasta --max-indels 3 --max-gap-size 3
 telox unknown_species.fasta --strict
 ```
 
-### Identifying Novel Telomere Motifs
-
-TeloX identifies novel telomere motifs by analyzing:
-
-1. **Strand Bias Patterns**: Telomere motifs typically show strong strand bias
-2. **End Enrichment**: Motifs enriched in the last 5000bp of scaffolds
-3. **Continuous Stretches**: Long continuous stretches of motif repeats
-4. **Statistical Significance**: Statistically significant bias ratios
-5. **Motif Conservation**: Consistent patterns across multiple scaffolds
-6. **Rotational Equivalence**: Groups related motif variants
-
 ### Example Output
 
 ```bash
@@ -295,29 +284,6 @@ telox genome.fasta extract_lastN 10000 telomere_regions.fasta
 # External KMC analysis
 telox kmc genome.fasta 6 kmc_db kmc_output.txt
 ```
-
-## Best Practices
-
-### For De Novo Discovery
-1. Use default parameters first: `telox genome.fasta`
-2. If no results, try strict mode: `telox genome.fasta --strict`
-3. For noisy data, increase stringency: `telox genome.fasta --max-indels 2 --max-gap-size 2`
-
-### For Known Telomere Species
-1. Standard analysis will find predefined motifs automatically
-2. Results appear in `initial_anno.txt` if found
-
-### For Comparative Studies
-1. Use consistent parameters across species
-2. Compare `telomere_motif_final.json` results
-3. Analyze rotational variants in consolidated output
-
-## Limitations
-
-- Focuses on scaffolds ≥1MB for computational efficiency
-- Analyzes last 5000bp of scaffolds (telomere-enriched regions)
-- K-mer analysis limited to 5-15 nucleotides
-- Memory usage scales with genome size and number of k-mers
 
 ## Troubleshooting
 
