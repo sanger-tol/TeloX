@@ -59,6 +59,8 @@ pub struct StrandBiasAnalysis {
     pub bias_direction: String,  // "forward", "reverse", or "balanced"
     pub significance: String,    // "strong", "moderate", or "weak"
     pub longest_stretch: usize,  // longest continuous stretch in the sequence(s)
+    pub longest_stretch_with_indels: usize,  // longest stretch allowing indels
+    pub indel_tolerance_used: bool,  // whether indel tolerance was beneficial
 }
 
 fn is_homopolymer(seq: &str) -> bool {
@@ -67,6 +69,16 @@ fn is_homopolymer(seq: &str) -> bool {
     }
     let first = seq.chars().next().unwrap();
     seq.chars().all(|c| c == first)
+}
+
+fn is_dinucleotide_repeat(seq: &str) -> bool {
+    is_dinucleotide_repeat_bytes(seq.as_bytes())
+}
+
+
+
+fn is_simple_repeat(seq: &str) -> bool {
+    is_simple_repeat_bytes(seq.as_bytes())
 }
 
 fn g_content(seq: &str) -> f64 {
@@ -100,7 +112,6 @@ pub fn longest_continuous_stretch_for_kmers(
     sequence: &str,
     kmers: &[String],
 ) -> HashMap<String, usize> {
-    use std::collections::HashSet;
     let seq_bytes = sequence.as_bytes();
     if kmers.is_empty() || sequence.is_empty() {
         return HashMap::new();
@@ -159,6 +170,148 @@ pub fn longest_continuous_stretch_for_kmers(
     run_map.into_iter().map(|(k, (_cur, max))| (k, max)).collect()
 }
 
+/// Advanced longest stretch analysis allowing for small indels and gaps.
+/// This function is more biologically relevant for telomeric sequences which may contain
+/// sequencing errors, assembly gaps, or natural variations.
+pub fn longest_continuous_stretch_with_indels(
+    sequence: &str,
+    kmers: &[String],
+    max_indels: usize,      // Maximum number of indels allowed per stretch
+    max_gap_size: usize,    // Maximum gap size before resetting (default: 5)
+) -> HashMap<String, usize> {
+    let seq_bytes = sequence.as_bytes();
+    if kmers.is_empty() || sequence.is_empty() {
+        return HashMap::new();
+    }
+    let k = kmers[0].len();
+    if k == 0 || k > seq_bytes.len() {
+        return kmers.iter().map(|kmer| (kmer.clone(), 0)).collect();
+    }
+
+    // Map canonical k-mer to all its forms (forward and reverse complement)
+    let mut kmer_forms: HashMap<Vec<u8>, String> = HashMap::new();
+    for kmer in kmers {
+        let rc = reverse_complement(kmer);
+        kmer_forms.insert(kmer.as_bytes().to_vec(), kmer.clone());
+        kmer_forms.insert(rc.as_bytes().to_vec(), kmer.clone());
+    }
+
+    // Track state for each k-mer: (current_stretch, max_stretch, current_indels, last_match_pos)
+    let mut kmer_states: HashMap<String, (usize, usize, usize, Option<usize>)> = HashMap::new();
+    for kmer in kmers {
+        kmer_states.insert(kmer.clone(), (0, 0, 0, None));
+    }
+
+    let mut i = 0;
+    while i + k <= seq_bytes.len() {
+        let window = &seq_bytes[i..i + k];
+        
+        if let Some(canonical) = kmer_forms.get(window) {
+            // Found a k-mer match
+            let state = kmer_states.get_mut(canonical).unwrap();
+            
+            match state.3 {
+                None => {
+                    // First match for this k-mer
+                    state.0 = 1;
+                    state.1 = state.1.max(1);
+                    state.2 = 0;
+                    state.3 = Some(i);
+                }
+                Some(last_pos) => {
+                    // Calculate gap since last match
+                    let expected_next = last_pos + k;
+                    let gap_size = if i >= expected_next {
+                        i - expected_next
+                    } else {
+                        0  // Overlapping matches, treat as continuous
+                    };
+                    
+                    if gap_size == 0 {
+                        // Perfect continuation
+                        state.0 += 1;
+                        state.1 = state.1.max(state.0);
+                    } else if gap_size <= max_gap_size {
+                        // Small gap - consume indel budget based on gap size
+                        let indel_cost = match gap_size {
+                            1..=2 => 1,
+                            3..=5 => 2,
+                            _ => gap_size / 2,  // Larger gaps cost more
+                        };
+                        
+                        if state.2 + indel_cost <= max_indels {
+                            // Can afford this gap
+                            state.0 += 1;
+                            state.1 = state.1.max(state.0);
+                            state.2 += indel_cost;
+                        } else {
+                            // Too many indels, reset this k-mer's stretch
+                            state.0 = 1;
+                            state.2 = 0;
+                        }
+                    } else {
+                        // Gap too large, reset
+                        state.0 = 1;
+                        state.2 = 0;
+                    }
+                    
+                    state.3 = Some(i);
+                }
+            }
+            
+            // Reset other k-mers if they had gaps
+            for (other_kmer, other_state) in kmer_states.iter_mut() {
+                if other_kmer != canonical {
+                    if let Some(other_last_pos) = other_state.3 {
+                        let other_expected = other_last_pos + k;
+                        let other_gap = if i >= other_expected {
+                            i - other_expected
+                        } else {
+                            0
+                        };
+                        
+                        // If gap is too large for the other k-mer, reset it
+                        if other_gap > max_gap_size {
+                            other_state.0 = 0;
+                            other_state.2 = 0;
+                            other_state.3 = None;
+                        }
+                    }
+                }
+            }
+            
+            i += k;  // Advance by k-mer length
+        } else {
+            // No match at this position, advance by 1
+            // Update gap tracking for all k-mers
+            for (_kmer, state) in kmer_states.iter_mut() {
+                if let Some(last_pos) = state.3 {
+                    let expected_next = last_pos + k;
+                    let gap_size = if i >= expected_next {
+                        i - expected_next + 1  // +1 for current mismatch
+                    } else {
+                        1
+                    };
+                    
+                    // If gap becomes too large, reset
+                    if gap_size > max_gap_size {
+                        state.0 = 0;
+                        state.2 = 0;
+                        state.3 = None;
+                    }
+                }
+            }
+            
+            i += 1;
+        }
+    }
+
+    // Extract final max stretches
+    kmer_states.into_iter()
+        .map(|(kmer, (_current, max, _indels, _last_pos))| (kmer, max))
+        .collect()
+}
+
 fn is_homopolymer_bytes(seq: &[u8]) -> bool {
     if seq.is_empty() {
         return false;
@@ -193,6 +346,64 @@ fn is_dinucleotide_repeat_bytes(seq: &[u8]) -> bool {
         }
     }
     true
+}
+
+
+
+fn is_simple_repeat_bytes(seq: &[u8]) -> bool {
+    let len = seq.len();
+    if len < 4 {
+        return false;
+    }
+    
+    // Check for repeats of length 1-4
+    for repeat_len in 1..=4 {
+        if len % repeat_len == 0 && len >= repeat_len * 2 {
+            let pattern = &seq[0..repeat_len];
+            let mut is_repeat = true;
+            for i in (repeat_len..len).step_by(repeat_len) {
+                if &seq[i..i + repeat_len] != pattern {
+                    is_repeat = false;
+                    break;
+                }
+            }
+            if is_repeat {
+                // Additional check: avoid flagging complex sequences as simple repeats
+                let unique_bases: std::collections::HashSet<u8> = pattern.iter().cloned().collect();
+                if unique_bases.len() <= 2 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if a k-mer is composed of tandem repeats of a shorter unit (up to k/2 length)
+/// This helps identify cases like AACCGAACCG (which is 2x AACCG) that should be filtered out
+fn is_tandem_repeat_kmer(seq: &str) -> bool {
+    let len = seq.len();
+    if len < 6 {  // Only check k-mers of 6+ bp
+        return false;
+    }
+    
+    // Check for tandem repeats of length 2 to k/2
+    for repeat_len in 2..=(len/2) {
+        if len % repeat_len == 0 && len >= repeat_len * 2 {
+            let pattern = &seq[0..repeat_len];
+            let mut is_repeat = true;
+            for i in (repeat_len..len).step_by(repeat_len) {
+                if &seq[i..i + repeat_len] != pattern {
+                    is_repeat = false;
+                    break;
+                }
+            }
+            if is_repeat {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn count_kmers_in_fasta(
@@ -231,6 +442,15 @@ pub fn count_kmers_in_fasta(
             }
             if is_dinucleotide_repeat_bytes(&forward[..k]) {
                 continue;
+            }
+            if is_simple_repeat_bytes(&forward[..k]) {
+                continue;
+            }
+            // Filter out tandem repeat k-mers (e.g., AACCGAACCG which is 2x AACCG)
+            if let Ok(kmer_str) = std::str::from_utf8(&forward[..k]) {
+                if is_tandem_repeat_kmer(kmer_str) {
+                    continue;
+                }
             }
             if forward[..k].iter().any(|&c| c.is_ascii_whitespace()) || rc[..k].iter().any(|&c| c.is_ascii_whitespace()) {
                 continue;
@@ -294,6 +514,14 @@ pub fn analyze_strand_bias(
     counts: &HashMap<String, KmerPair>,
     longest_stretch_map: Option<&HashMap<String, usize>>,
 ) -> Vec<StrandBiasAnalysis> {
+    analyze_strand_bias_with_indels(counts, longest_stretch_map, None)
+}
+
+pub fn analyze_strand_bias_with_indels(
+    counts: &HashMap<String, KmerPair>,
+    longest_stretch_map: Option<&HashMap<String, usize>>,
+    longest_stretch_indels_map: Option<&HashMap<String, usize>>,
+) -> Vec<StrandBiasAnalysis> {
     let mut bias_analyses = Vec::new();
     
     for (kmer, pair) in counts {
@@ -322,6 +550,13 @@ pub fn analyze_strand_bias(
             .and_then(|m| m.get(kmer))
             .copied()
             .unwrap_or(0);
+            
+        let longest_stretch_with_indels = longest_stretch_indels_map
+            .and_then(|m| m.get(kmer))
+            .copied()
+            .unwrap_or(longest_stretch);  // Default to exact stretch if not provided
+            
+        let indel_tolerance_used = longest_stretch_with_indels > longest_stretch;
         
         bias_analyses.push(StrandBiasAnalysis {
             kmer: kmer.clone(),
@@ -332,6 +567,8 @@ pub fn analyze_strand_bias(
             bias_direction,
             significance,
             longest_stretch,
+            longest_stretch_with_indels,
+            indel_tolerance_used,
         });
     }
     
@@ -346,9 +583,9 @@ pub fn analyze_strand_bias(
 }
 
 pub fn print_strand_bias_table(analyses: &[StrandBiasAnalysis], top_n: usize) {
-    println!("\n{:<15} {:<10} {:<10} {:<10} {:<12} {:<10} {:<10}", 
-             "K-mer", "Forward", "RC", "Total", "Bias Ratio", "Direction", "Significance");
-    println!("{}", "-".repeat(85));
+    println!("\n{:<15} {:<10} {:<10} {:<10} {:<12} {:<10} {:<10} {:<8} {:<8} {:<8}", 
+             "K-mer", "Forward", "RC", "Total", "Bias Ratio", "Direction", "Significance", "Stretch", "StretchI", "Improved");
+    println!("{}", "-".repeat(115));
 
     for analysis in analyses.iter().take(top_n) {
         let ratio_str = if analysis.bias_ratio == f64::INFINITY {
@@ -357,20 +594,25 @@ pub fn print_strand_bias_table(analyses: &[StrandBiasAnalysis], top_n: usize) {
             format!("{:.2}", analysis.bias_ratio)
         };
         
-        println!("{:<15} {:<10} {:<10} {:<10} {:<12} {:<10} {:<10}",
+        let improved = if analysis.indel_tolerance_used { "Yes" } else { "No" };
+        
+        println!("{:<15} {:<10} {:<10} {:<10} {:<12} {:<10} {:<10} {:<8} {:<8} {:<8}",
                  analysis.kmer,
                  analysis.forward_count,
                  analysis.rc_count,
                  analysis.total_count,
                  ratio_str,
                  analysis.bias_direction,
-                 analysis.significance);
+                 analysis.significance,
+                 analysis.longest_stretch,
+                 analysis.longest_stretch_with_indels,
+                 improved);
     }
 }
 
 pub fn save_strand_bias_table(analyses: &[StrandBiasAnalysis], output_path: &str) -> Result<()> {
     let mut content = String::new();
-    content.push_str("Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\n");
+    content.push_str("Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\tLongestStretch\tLongestStretchIndels\tIndelImproved\n");
     
     for analysis in analyses {
         let ratio_str = if analysis.bias_ratio == f64::INFINITY {
@@ -379,14 +621,19 @@ pub fn save_strand_bias_table(analyses: &[StrandBiasAnalysis], output_path: &str
             format!("{:.3}", analysis.bias_ratio)
         };
         
-        content.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        let improved = if analysis.indel_tolerance_used { "true" } else { "false" };
+        
+        content.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             analysis.kmer,
             analysis.forward_count,
             analysis.rc_count,
             analysis.total_count,
             ratio_str,
             analysis.bias_direction,
-            analysis.significance
+            analysis.significance,
+            analysis.longest_stretch,
+            analysis.longest_stretch_with_indels,
+            improved
         ));
     }
     
@@ -568,6 +815,13 @@ pub fn analyze_kmc_kmers(
         if is_dinucleotide_repeat_bytes(canonical.as_bytes()) {
             continue;
         }
+        if is_simple_repeat_bytes(canonical.as_bytes()) {
+            continue;
+        }
+        // Filter out tandem repeat k-mers
+        if is_tandem_repeat_kmer(&canonical) {
+            continue;
+        }
         if canonical.chars().any(|c| c.is_whitespace()) || reverse_complement(&canonical).chars().any(|c| c.is_whitespace()) {
             continue;
         }
@@ -588,10 +842,12 @@ pub fn analyze_kmc_kmers(
     analyze_strand_bias(&canonical_counts, None)
 }
 
-/// Optimized k-mer counting for the last 5000bp of each scaffold using parallel processing
-pub fn count_kmers_last_5000bp_parallel(
+/// Optimized k-mer counting for the last N bp of each scaffold using parallel processing
+/// Only processes scaffolds larger than 1MB (1,000,000 bp)
+pub fn count_kmers_last_n_bp_parallel(
     fasta_path: impl AsRef<Path>,
     k: usize,
+    n: usize,
 ) -> Result<HashMap<String, KmerPair>> {
     if k == 0 {
         return Err(anyhow!("k must be greater than 0"));
@@ -600,22 +856,36 @@ pub fn count_kmers_last_5000bp_parallel(
         return Err(anyhow!("k must be <= 32 for fixed-size array optimization"));
     }
 
-    // Read all sequences first
+    // Read all sequences first, filtering by size
     let mut reader = parse_fastx_file(fasta_path)?;
     let mut sequences = Vec::new();
+    let mut filtered_count = 0;
+    let mut processed_count = 0;
+    
     while let Some(record) = reader.next() {
         let seqrec = record?;
         seqrec.normalize(true);
-        sequences.push(seqrec.seq().to_vec());
+        let seq = seqrec.seq().to_vec();
+        
+        // Only process scaffolds larger than 1MB (1,000,000 bp)
+        if seq.len() < 1_000_000 {
+            filtered_count += 1;
+            continue;
+        }
+        
+        processed_count += 1;
+        sequences.push(seq);
     }
+    
+    eprintln!("K-mer counting: processing {} scaffolds >= 1MB, filtered out {} smaller scaffolds", processed_count, filtered_count);
 
     // Process sequences in parallel
     let results: Vec<HashMap<[u8; 32], KmerPair, RandomState>> = sequences.par_iter().map(|seq| {
         let mut local_counts: HashMap<[u8; 32], KmerPair, RandomState> = HashMap::with_hasher(RandomState::new());
         
-        // Get the last 5000bp slice
+        // Get the last N bp slice
         let seq_len = seq.len();
-        let start_pos = if seq_len > 5000 { seq_len - 5000 } else { 0 };
+        let start_pos = if seq_len > n { seq_len - n } else { 0 };
         let seq_slice = &seq[start_pos..];
         
         // Count k-mers in the slice
@@ -647,6 +917,15 @@ pub fn count_kmers_last_5000bp_parallel(
             }
             if is_dinucleotide_repeat_bytes(&forward[..k]) {
                 continue;
+            }
+            if is_simple_repeat_bytes(&forward[..k]) {
+                continue;
+            }
+            // Filter out tandem repeat k-mers (e.g., AACCGAACCG which is 2x AACCG)
+            if let Ok(kmer_str) = std::str::from_utf8(&forward[..k]) {
+                if is_tandem_repeat_kmer(kmer_str) {
+                    continue;
+                }
             }
             if forward[..k].iter().any(|&c| c.is_ascii_whitespace()) || rc[..k].iter().any(|&c| c.is_ascii_whitespace()) {
                 continue;
@@ -704,24 +983,51 @@ pub fn count_kmers_last_5000bp_parallel(
 }
 
 /// Extract the last N bp of each scaffold/sequence from a FASTA file and write to a new FASTA file.
+/// Only processes scaffolds larger than 1MB and merges them into a single sequence separated by spaces.
 pub fn extract_last_n_bp_to_fasta(input_fasta: &str, output_fasta: &str, n: usize) -> std::io::Result<()> {
     let mut reader = parse_fastx_file(input_fasta)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
     let mut writer = std::fs::File::create(output_fasta)?;
+    
+    let mut merged_sequence = Vec::new();
+    let mut scaffold_count = 0;
+    let mut filtered_count = 0;
+    
     while let Some(record) = reader.next() {
         let seqrec = record.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
-        let name = std::str::from_utf8(seqrec.id()).unwrap_or("scaffold");
         let seq = seqrec.seq();
         let len = seq.len();
+        
+        // Only process scaffolds larger than 1MB (1,000,000 bp)
+        if len < 1_000_000 {
+            filtered_count += 1;
+            continue;
+        }
+        
+        scaffold_count += 1;
         let start = if len > n { len - n } else { 0 };
         let last_n = &seq[start..];
-        // Write FASTA header
-        writeln!(writer, ">{}", name)?;
-        // Write sequence in 60bp lines
-        for chunk in last_n.chunks(60) {
-            writeln!(writer, "{}", std::str::from_utf8(chunk).unwrap_or(""))?;
+        
+        // Add space separator if this is not the first sequence
+        if !merged_sequence.is_empty() {
+            merged_sequence.push(b' ');
         }
+        
+        // Add the sequence
+        merged_sequence.extend_from_slice(last_n);
     }
+    
+    // Write the merged sequence as a single FASTA entry
+    writeln!(writer, ">merged_large_scaffolds_last{}bp_count{}", n, scaffold_count)?;
+    
+    // Write sequence in 60bp lines
+    for chunk in merged_sequence.chunks(60) {
+        writeln!(writer, "{}", std::str::from_utf8(chunk).unwrap_or(""))?;
+    }
+    
+    eprintln!("Processed {} scaffolds >= 1MB, filtered out {} smaller scaffolds", scaffold_count, filtered_count);
+    eprintln!("Total merged sequence length: {} bp", merged_sequence.len());
+    
     Ok(())
 }
 
@@ -780,6 +1086,13 @@ pub fn parse_kmc_b_output_and_analyze(
             continue;
         }
         if is_dinucleotide_repeat_bytes(canonical.as_bytes()) {
+            continue;
+        }
+        if is_simple_repeat_bytes(canonical.as_bytes()) {
+            continue;
+        }
+        // Filter out tandem repeat k-mers
+        if is_tandem_repeat_kmer(&canonical) {
             continue;
         }
         if canonical.chars().any(|c| c.is_whitespace()) || reverse_complement(canonical).chars().any(|c| c.is_whitespace()) {
@@ -853,18 +1166,40 @@ pub fn gather_and_rank_filtered_results(filtered_files: &[&str], output_file: &s
 
 /// Given a rank.tsv file, return a Vec<String> of unique motifs consolidated by their minimal rotation (lex smallest rotation), like TELO_MOTIF_DB.
 pub fn consolidate_ranked_motifs_by_rotation(rank_tsv: &str) -> anyhow::Result<Vec<String>> {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
+    
+    #[derive(Debug)]
+    struct MotifData {
+        kmer: String,
+        forward: u32,
+        reverse: u32,
+        longest_stretch: usize,
+    }
+    
     let file = std::fs::File::open(rank_tsv)?;
     let reader = std::io::BufReader::new(file);
-    let mut motifs = Vec::new();
+    let mut motif_data = Vec::new();
+    
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
         if i == 0 || line.trim().is_empty() { continue; } // skip header/empty
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.is_empty() { continue; }
-        motifs.push(cols[0].to_string());
+        if cols.len() < 8 { continue; }
+        
+        let kmer = cols[0].to_string();
+        let forward: u32 = cols[1].parse().unwrap_or(0);
+        let reverse: u32 = cols[2].parse().unwrap_or(0);
+        let longest_stretch: usize = cols[7].parse().unwrap_or(0);
+        
+        motif_data.push(MotifData {
+            kmer,
+            forward,
+            reverse,
+            longest_stretch,
+        });
     }
-    // Use min_rotation logic from consolidate_rotational_kmers
+    
+    // Helper function to find minimal rotation
     fn min_rotation(s: &str) -> String {
         let k = s.len();
         let mut min = s.to_string();
@@ -877,13 +1212,134 @@ pub fn consolidate_ranked_motifs_by_rotation(rank_tsv: &str) -> anyhow::Result<V
         }
         min
     }
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    for motif in motifs {
-        let canonical = min_rotation(&motif);
-        if seen.insert(canonical.clone()) {
-            result.push(canonical);
-        }
+    
+    // Group motifs by their canonical (minimal) rotation
+    let mut rotation_groups: HashMap<String, Vec<MotifData>> = HashMap::new();
+    for data in motif_data {
+        let canonical = min_rotation(&data.kmer);
+        rotation_groups.entry(canonical).or_insert_with(Vec::new).push(data);
     }
+    
+    // Create consolidated groups with combined statistics
+    let mut consolidated_groups = Vec::new();
+    for (canonical, variants) in rotation_groups {
+        let all_variants: Vec<String> = variants.iter().map(|v| v.kmer.clone()).collect();
+        let forward_total: u32 = variants.iter().map(|v| v.forward).sum();
+        let reverse_total: u32 = variants.iter().map(|v| v.reverse).sum();
+        let max_longest_stretch: usize = variants.iter().map(|v| v.longest_stretch).max().unwrap_or(0);
+        
+        consolidated_groups.push((canonical, all_variants, forward_total, reverse_total, max_longest_stretch));
+    }
+    
+    // Sort by max longest stretch (descending), then by total frequency (descending)
+    consolidated_groups.sort_by(|a, b| b.4.cmp(&a.4).then((b.2 + b.3).cmp(&(a.2 + a.3))));
+    
+    // Print consolidated rotational groups table
+    println!("\nConsolidated Rotational Groups:");
+    println!("{}", "=".repeat(90));
+    println!("{:<15} {:<30} {:<15} {:<15} {:<15}", 
+             "Canonical_kmer", "kmer_group", "forward_total", "reverse_total", "longeststretch");
+    println!("{}", "-".repeat(90));
+    
+    for (canonical, variants, forward_total, reverse_total, max_stretch) in &consolidated_groups {
+        let variants_str = variants.join(",");
+        println!("{:<15} {:<30} {:<15} {:<15} {:<15}", 
+                 canonical, variants_str, forward_total, reverse_total, max_stretch);
+    }
+    
+    // Identify the most likely telomere motif
+    let most_likely_motif = if let Some((canonical, variants, forward_total, reverse_total, max_stretch)) = consolidated_groups.first() {
+        let total_frequency = forward_total + reverse_total;
+        
+        // Create telomere motif result
+        let telomere_result = serde_json::json!({
+            "most_likely_telomere_motif": {
+                "canonical_sequence": canonical,
+                "rotational_variants": variants,
+                "statistics": {
+                    "forward_count": forward_total,
+                    "reverse_count": reverse_total,
+                    "total_frequency": total_frequency,
+                    "longest_continuous_stretch": max_stretch
+                },
+                "analysis_rationale": format!(
+                    "Selected as most likely telomere motif based on highest longest stretch ({}) and total frequency ({})",
+                    max_stretch, total_frequency
+                )
+            },
+            "analysis_metadata": {
+                "total_motif_groups_analyzed": consolidated_groups.len(),
+                "selection_criteria": ["longest_continuous_stretch", "total_frequency"],
+                "data_source": "k-mer_discovery_pipeline"
+            }
+        });
+        
+        // Write to JSON file
+        match std::fs::write("telomere_motif_final.json", serde_json::to_string_pretty(&telomere_result).unwrap()) {
+            Ok(_) => {
+                println!("\nMost likely telomere motif identified:");
+                println!("Canonical sequence: {}", canonical);
+                println!("Rotational variants: {}", variants.join(", "));
+                println!("Total frequency: {} (Forward: {}, Reverse: {})", total_frequency, forward_total, reverse_total);
+                println!("Longest stretch: {}", max_stretch);
+                println!("Result written to: telomere_motif_final.json");
+            },
+            Err(e) => {
+                eprintln!("Error writing telomere_motif_final.json: {}", e);
+            }
+        }
+        
+        Some(canonical.clone())
+    } else {
+        println!("No telomere motifs found in consolidated results");
+        None
+    };
+
+    // Return unique canonical representatives for the motif database
+    let result: Vec<String> = consolidated_groups.into_iter()
+        .map(|(canonical, _, _, _, _)| canonical)
+        .collect();
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_indel_tolerant_stretch() {
+        // Test sequence with a telomere-like pattern with gaps
+        let sequence = "TTAGGGTTAGGGTTACGGTTAGGGTTAGGG"; // TTAGGG with 2bp gap
+        let kmers = vec!["TTAGGG".to_string()];
+        
+        // Exact matching should give shorter stretch
+        let exact_result = longest_continuous_stretch_for_kmers(sequence, &kmers);
+        
+        // Indel-tolerant should give longer stretch
+        let indel_result = longest_continuous_stretch_with_indels(sequence, &kmers, 5, 5);
+        
+        println!("Test sequence: {}", sequence);
+        println!("Exact stretch: {:?}", exact_result);
+        println!("Indel-tolerant stretch: {:?}", indel_result);
+        
+        // The indel-tolerant version should handle the 2bp gap better
+        assert!(indel_result.get("TTAGGG").unwrap_or(&0) >= exact_result.get("TTAGGG").unwrap_or(&0));
+    }
+    
+    #[test]
+    fn test_strict_vs_indel_tolerant() {
+        // Sequence with perfect telomere repeats plus some with gaps
+        let sequence = "TTAGGGTTAGGGTTAGGGNNNAGGGTTAGGGTTAGGG";
+        let kmers = vec!["TTAGGG".to_string()];
+        
+        let exact = longest_continuous_stretch_for_kmers(sequence, &kmers);
+        let indel = longest_continuous_stretch_with_indels(sequence, &kmers, 3, 3);
+        
+        println!("Sequence with gaps: {}", sequence);
+        println!("Exact: {:?}", exact);
+        println!("Indel-tolerant: {:?}", indel);
+        
+        // Indel-tolerant should be >= exact
+        assert!(indel.get("TTAGGG").unwrap_or(&0) >= exact.get("TTAGGG").unwrap_or(&0));
+    }
 }

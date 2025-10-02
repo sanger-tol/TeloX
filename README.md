@@ -4,30 +4,31 @@
 
 ## Features
 
+- **Two-stage telomere discovery** - Predefined motif search followed by k-mer discovery pipeline
 - **De novo telomere motif discovery** - Automatically identify novel telomere motifs in species genomes
-- **High-performance k-mer counting** using KMC (K-Mer Counter) for fast processing of large genomes
+- **Comprehensive k-mer analysis** (5-15 mers) with biological filtering
 - **Strand bias analysis** with statistical significance testing
-- **Telomere motif identification** with customizable motif databases
-- **Longest continuous stretch analysis** for motif clustering assessment
+- **Longest continuous stretch analysis** with indel tolerance options
+- **Tandem repeat filtering** - Prevents composite k-mers from inflating results
+- **Rotational motif consolidation** - Groups rotational variants of the same motif
 - **Parallel processing** using Rayon for multi-threaded performance
-- **Memory-efficient algorithms** with optimized data structures
-- **Comprehensive output formats** including TSV tables and summary statistics
-- **Hybrid approach** combining KMC for counting and Rust for positional analysis
+- **Memory-efficient algorithms** optimized for large genomes (≥1MB scaffolds)
+- **Comprehensive output formats** including TSV tables, JSON results, and debug information
+- **Intelligent motif ranking** based on stretch length and frequency
 
 ## Installation
 
 ### Prerequisites
 
 - Rust (version 1.70 or higher)
-- KMC (K-Mer Counter) - [Download from GitHub](https://github.com/refresh-bio/KMC)
-- Make sure KMC binaries (`kmc` and `kmc_dump`) are in your PATH
+- Optional: KMC (K-Mer Counter) for external k-mer counting - [Download from GitHub](https://github.com/refresh-bio/KMC)
 
 ### Building from Source
 
 ```bash
 # Clone the repository
 git clone https://github.com/your-username/telox.git
-cd telox
+cd telox/telox
 
 # Build the project
 cargo build --release
@@ -43,133 +44,160 @@ The compiled binary will be available at `target/release/telox`.
 ### Basic Usage
 
 ```bash
-# Analyze telomere motifs in a FASTA file
-telox input.fasta
+# Standard telomere analysis (two-stage approach)
+telox genome.fasta
 
-# Specify custom telomere motif
-telox --telo-motif "TTAGGG" input.fasta
+# With indel tolerance parameters
+telox genome.fasta --max-indels 5 --max-gap-size 5
 
-# List available telomere motifs
-telox --print-telo-motifs
+# Strict mode (exact matching only)
+telox genome.fasta --strict
 ```
 
 ### Advanced Usage
 
 ```bash
-# K-mer analysis with strand bias
-telox --kmer-size 6 --strand-bias input.fasta
+# Extract last N bp of large scaffolds to separate FASTA
+telox genome.fasta extract_lastN 10000 last10000.fasta
 
-# Analyze last 5000bp of each scaffold for strand-specific counts
-telox --last-5000bp --kmer-size 6 input.fasta
-
-# Filter results by significance and stretch length
-telox --filter-significant --min-stretch 2 input.fasta
-
-# Output to specific files
-telox --output-prefix results input.fasta
+# KMC pipeline mode (external k-mer counting)
+telox kmc input.fasta 7 kmc_db kmc_output.txt
 ```
 
 ### Command Line Options
 
 ```
 USAGE:
-    telox [OPTIONS] <FASTA_FILE>
+    telox <FASTA_FILE> [OPTIONS]
+    telox kmc <input_fasta> <k> <db_prefix> <output_txt>
+    telox <fasta_file> extract_lastN <N> <output_fasta>
 
 ARGS:
     <FASTA_FILE>    Input FASTA file to analyze
 
 OPTIONS:
-    -k, --kmer-size <SIZE>           K-mer size for analysis [default: 6]
-    --telo-motif <MOTIF>             Custom telomere motif to search for
-    --print-telo-motifs              Print available telomere motifs and exit
-    --strand-bias                    Perform strand bias analysis
-    --last-5000bp                    Analyze last 5000bp of each scaffold
-    --filter-significant             Filter results by significance
-    --min-stretch <LENGTH>           Minimum stretch length for filtering [default: 2]
-    --output-prefix <PREFIX>         Output file prefix [default: telox]
-    -h, --help                       Print help information
-    -V, --version                    Print version information
+    --max-indels <N>      Maximum indels allowed in stretch analysis [default: 5]
+    --max-gap-size <N>    Maximum gap size before resetting stretch [default: 5]
+    --strict              Use exact matching only (no indel tolerance)
+    -h, --help           Print help information
+    -V, --version        Print version information
+
+EXAMPLES:
+    telox genome.fasta                           # Standard analysis with indel tolerance
+    telox genome.fasta --max-indels 3 --max-gap-size 3  # More strict indel tolerance
+    telox genome.fasta --strict                  # Exact matching only
+    telox genome.fasta extract_lastN 10000 last10000.fasta
+    telox kmc last5000.fasta 7 kmc_db kmc_dump.txt
 ```
+
+## Algorithm Overview
+
+### Two-Stage Approach
+
+TeloX uses a sophisticated two-stage approach for telomere discovery:
+
+**Stage 1: Predefined Motif Search**
+- Searches for 23 known telomere motifs using the `telo_finder` algorithm
+- Uses optimized scoring system (match: +1, mismatch: -1, max drop: 2000, min score: 300)
+- If telomeres are found, analysis completes with results in `initial_anno.txt`
+
+**Stage 2: K-mer Discovery Pipeline** (if Stage 1 finds no telomeres)
+- Analyzes k-mers from 5-15 nucleotides in length
+- Processes last 5000bp of scaffolds ≥1MB for telomere-enriched regions
+- Applies comprehensive biological filters
+- Performs strand bias analysis and longest stretch calculations
+- Ranks and consolidates results by rotational equivalence
+- Generates new motif database for final telomere search
+
+### Biological Filtering
+
+TeloX applies rigorous biological filters to ensure high-quality results:
+
+1. **N-base removal** - Excludes k-mers containing ambiguous bases
+2. **Homopolymer filtering** - Removes simple repeats (AAAA, TTTT, etc.)
+3. **Dinucleotide repeat filtering** - Excludes alternating patterns (ATATAT, etc.)
+4. **Simple repeat filtering** - Removes tandem repeats of 1-4bp units
+5. **Tandem repeat k-mer filtering** - NEW: Prevents composite k-mers (e.g., AACCGAACCG = 2×AACCG)
+6. **G/C content filtering** - Requires >28% G or C content on either strand
+7. **Quality thresholds** - Longest stretch ≥2, significance ≠ "weak"
+
+### Longest Stretch Analysis
+
+Two modes available:
+
+**Exact Matching** (--strict):
+- Counts consecutive, non-overlapping k-mer occurrences
+- Requires perfect sequence matches
+
+**Indel-Tolerant** (default):
+- Allows small gaps and indels in stretch calculation
+- Configurable parameters: `--max-indels` and `--max-gap-size`
+- More biologically relevant for real sequencing data
+
+### Rotational Consolidation
+
+Groups rotational variants of the same motif:
+- Example: TTAGGG, TAGGGT, AGGGTT, GGGTTA → canonical AGGGTT
+- Combines statistics: forward counts, reverse counts, max stretch
+- Prevents redundant motif identification
 
 ## Output Files
 
-TeloX generates several output files depending on the analysis performed:
+TeloX generates comprehensive output files:
 
-- `{prefix}_strand_bias.tsv` - Strand bias analysis results
-- `{prefix}_filtered.tsv` - Filtered results (significant motifs only)
-- `{prefix}_summary.txt` - Summary statistics
-- `{prefix}_last_5000bp.tsv` - Last 5000bp analysis results
+### Primary Output Files
+- `initial_anno.txt` - Results from predefined motif search (Stage 1)
+- `anno.txt` - Results from discovered motifs (Stage 2)
+- `telomere_candidate.json` - Structured results for machine processing
+- `telomere_motif_final.json` - Most likely telomere motif with statistics
+
+### Analysis Files
+- `strand_bias_Nmer.tsv` - Strand bias analysis for each k-mer size (N=5-15)
+- `rank.tsv` - All filtered k-mers ranked by stretch and frequency
+
+### Debug Files (when enabled)
+- K-mer count tables for each size
+- Top longest stretch results
+- Processing statistics
 
 ### Output Format
 
 The strand bias analysis includes:
-- **kmer**: The k-mer sequence
-- **forward_count**: Count in forward orientation
-- **rc_count**: Count in reverse complement orientation
-- **total_count**: Total count across both orientations
-- **bias_ratio**: Ratio of forward to reverse complement counts
-- **bias_direction**: Direction of bias (forward/reverse/balanced)
-- **significance**: Statistical significance (strong/moderate/weak)
-- **longest_stretch**: Longest continuous stretch of the motif
+- **Kmer**: The k-mer sequence
+- **Forward**: Count in forward orientation
+- **RC**: Count in reverse complement orientation  
+- **Total**: Total count across both orientations
+- **BiasRatio**: Ratio of forward to reverse complement counts
+- **Direction**: Direction of bias (forward/reverse/balanced)
+- **Significance**: Statistical significance (strong/weak)
+- **LongestStretchIndels**: Longest continuous stretch (with indel tolerance)
+
+### Consolidated Results Format
+
+```
+Canonical_kmer  kmer_group                     forward_total   reverse_total   longeststretch
+AGGGTT          TTAGGG,TAGGGT,AGGGTT,GGGTTA  1250            890             15
+AACCCT          CCCTAA,CCTAAC                 456             234             12
+```
 
 ## Telomere Motif Database
 
-TeloX includes a comprehensive database of known telomere motifs:
+TeloX includes a comprehensive database of 23 known telomere motifs:
 
 ```
-[ 1] AAAATTGTCCGTCC
-[ 2] AAACCACCCT
-[ 3] AAACCC
-[ 4] AAACCCC
-[ 5] AAACCCT
-[ 6] AAAGAACCT
-[ 7] AAATGTGGAGG
-[ 8] AACAGACCCG
-[ 9] AACCATCCCT
-[10] AACCC
-[11] AACCCAGACCC
+[ 1] AAAATTGTCCGTCC    [13] AACCCAGACGC
+[ 2] AAACCACCCT        [14] AACCCCAACCT
+[ 3] AAACCC            [15] AACCCGAACCT
+[ 4] AAACCCC           [16] AACCCT
+[ 5] AAACCCT           [17] AACCCTG
+[ 6] AAAGAACCT         [18] AACCCTGACGC
+[ 7] AAATGTGGAGG       [19] AACCT
+[ 8] AACAGACCCG        [20] AAGGAC
+[ 9] AACCATCCCT        [21] ACCCAG
+[10] AACCC             [22] ACCTG
+[11] AACCCAGACCC       [23] ACGGCAGCG
 [12] AACCCAGACCT
-[13] AACCCAGACGC
-[14] AACCCCAACCT
-[15] AACCCGAACCT
-[16] AACCCT
-[17] AACCCTG
-[18] AACCCTGACGC
-[19] AACCT
-[20] AAGGAC
-[21] ACCCAG
-[22] ACCTG
-[23] ACGGCAGCG
 ```
-
-## Performance Optimizations
-
-TeloX implements several performance optimizations:
-
-1. **KMC Integration**: Uses KMC for ultra-fast k-mer counting
-2. **Parallel Processing**: Multi-threaded analysis using Rayon
-3. **Memory Efficiency**: Optimized data structures and reduced allocations
-4. **Fast Hashing**: Uses ahash for high-performance hash tables
-5. **Byte-level Operations**: Efficient string processing with byte slices
-
-## Algorithm Details
-
-### Strand Bias Analysis
-
-The strand bias analysis calculates:
-- **Bias Ratio**: `forward_count / rc_count`
-- **Significance**: Based on chi-square test with Bonferroni correction
-- **Direction**: Determined by bias ratio thresholds
-
-### Longest Continuous Stretch
-
-For each k-mer, TeloX finds the longest continuous stretch of non-overlapping occurrences in the sequence, considering both forward and reverse complement orientations.
-
-### Hybrid Approach
-
-TeloX uses a hybrid approach combining:
-- **KMC**: For fast k-mer counting across entire genomes
-- **Rust**: For positional analysis and strand-specific counting in specific regions
 
 ## De Novo Telomere Motif Discovery
 
@@ -180,20 +208,17 @@ TeloX excels at **de novo identification** of telomere motifs in species genomes
 - **Comparative genomics** studies across different taxa
 - **Evolutionary studies** of telomere sequence diversity
 
-### De Novo Discovery Workflow
+### Discovery Workflow
 
 ```bash
-# 1. Perform comprehensive k-mer analysis to identify candidate motifs
-telox --kmer-size 6 --strand-bias genome.fasta
+# Standard de novo discovery
+telox unknown_species.fasta
 
-# 2. Filter for significant strand bias patterns
-telox --kmer-size 6 --strand-bias --filter-significant genome.fasta
+# With custom indel tolerance
+telox unknown_species.fasta --max-indels 3 --max-gap-size 3
 
-# 3. Analyze last 5000bp of scaffolds for telomere-enriched regions
-telox --last-5000bp --kmer-size 6 genome.fasta
-
-# 4. Generate filtered results for candidate telomere motifs
-telox --filter-significant --min-stretch 2 genome.fasta
+# Strict mode for highly conserved sequences
+telox unknown_species.fasta --strict
 ```
 
 ### Identifying Novel Telomere Motifs
@@ -205,36 +230,44 @@ TeloX identifies novel telomere motifs by analyzing:
 3. **Continuous Stretches**: Long continuous stretches of motif repeats
 4. **Statistical Significance**: Statistically significant bias ratios
 5. **Motif Conservation**: Consistent patterns across multiple scaffolds
+6. **Rotational Equivalence**: Groups related motif variants
 
-### Example: Discovering Unknown Telomere Motifs
+### Example Output
 
 ```bash
 # For a species with unknown telomere sequence
-telox --kmer-size 6 --strand-bias --last-5000bp --filter-significant genome.fasta
+telox new_species.fasta
 
-# This will output candidates like:
-# kmer    forward_count  rc_count  bias_ratio  significance  longest_stretch
-# TTAGGG  1250          45        27.78       strong        15
-# AACCCT  42            1180      0.036       strong        12
-# CCCTAA  1180          42        28.10       strong        12
+# Console output shows:
+Processing 5-mers...
+Top 20 5-mers by count:
+Rank      K-mer           Total Count     Forward         RC             
+----------------------------------------------------------------------
+1         AACCG           1250            800             450            
+
+Top 10 5-mers by longest stretch:
+  1: AACCG (stretch: 25, count: 1250)
+
+# Final consolidated results:
+Canonical_kmer  kmer_group     forward_total   reverse_total   longeststretch
+AACCG           AACCG,CCGAA    1250            890             25
+
+# JSON output in telomere_motif_final.json:
+{
+  "most_likely_telomere_motif": {
+    "canonical_sequence": "AACCG",
+    "rotational_variants": ["AACCG", "CCGAA"],
+    "statistics": {
+      "forward_count": 1250,
+      "reverse_count": 890,
+      "total_frequency": 2140,
+      "longest_continuous_stretch": 25
+    }
+  }
+}
 ```
-
-The top candidates with high bias ratios and long stretches are likely the telomere motifs for that species.
 
 ## Examples
-
-### De Novo Telomere Discovery
-
-```bash
-# Discover telomere motifs in a new species
-telox --kmer-size 6 --strand-bias --last-5000bp --filter-significant new_species.fasta
-
-# Analyze multiple k-mer sizes for comprehensive discovery
-telox --kmer-size 4 --strand-bias --filter-significant new_species.fasta
-telox --kmer-size 5 --strand-bias --filter-significant new_species.fasta
-telox --kmer-size 6 --strand-bias --filter-significant new_species.fasta
-telox --kmer-size 7 --strand-bias --filter-significant new_species.fasta
-```
 
 ### Basic Telomere Analysis
 
@@ -242,40 +275,73 @@ telox --kmer-size 7 --strand-bias --filter-significant new_species.fasta
 # Analyze telomere motifs in a genome assembly
 telox genome.fasta
 
-# Use custom telomere motif
-telox --telo-motif "TTAGGG" genome.fasta
+# With custom parameters
+telox genome.fasta --max-indels 3 --max-gap-size 2
 ```
 
-### K-mer Analysis with Strand Bias
+### Strict Analysis
 
 ```bash
-# Analyze 6-mers with strand bias
-telox --kmer-size 6 --strand-bias genome.fasta
-
-# Filter for significant results
-telox --kmer-size 6 --strand-bias --filter-significant genome.fasta
+# Exact matching only (no indel tolerance)
+telox genome.fasta --strict
 ```
 
-### Last 5000bp Analysis
+### Utility Functions
 
 ```bash
-# Analyze last 5000bp of each scaffold
-telox --last-5000bp --kmer-size 6 genome.fasta
+# Extract last 10kb of large scaffolds
+telox genome.fasta extract_lastN 10000 telomere_regions.fasta
+
+# External KMC analysis
+telox kmc genome.fasta 6 kmc_db kmc_output.txt
 ```
+
+## Best Practices
+
+### For De Novo Discovery
+1. Use default parameters first: `telox genome.fasta`
+2. If no results, try strict mode: `telox genome.fasta --strict`
+3. For noisy data, increase stringency: `telox genome.fasta --max-indels 2 --max-gap-size 2`
+
+### For Known Telomere Species
+1. Standard analysis will find predefined motifs automatically
+2. Results appear in `initial_anno.txt` if found
+
+### For Comparative Studies
+1. Use consistent parameters across species
+2. Compare `telomere_motif_final.json` results
+3. Analyze rotational variants in consolidated output
 
 ## Limitations
 
-- Requires KMC to be installed and available in PATH
-- Memory usage scales with genome size and k-mer size
-- Maximum k-mer size is limited by available memory
-- KMC output is limited to 255 counts by default (can be increased with `-cs` parameter)
+- Focuses on scaffolds ≥1MB for computational efficiency
+- Analyzes last 5000bp of scaffolds (telomere-enriched regions)
+- K-mer analysis limited to 5-15 nucleotides
+- Memory usage scales with genome size and number of k-mers
+
+## Troubleshooting
+
+### Common Issues
+
+**No telomeres found**: 
+- Try strict mode: `--strict`
+- Check if scaffolds are ≥1MB
+- Verify FASTA format
+
+**Composite k-mers identified**:
+- The tandem repeat filter should prevent this
+- Check debug output for filtering statistics
+
+**Memory issues**:
+- Process smaller genome chunks
+- Use external KMC mode for very large genomes
 
 ## Citation
 
 If you use TeloX in your research, please cite:
 
 ```
-Yumi Sims, Chenxi Zhou. TeloX: Telomere Motif Extraction Tool. 
+Yumi Sims, Chenxi Zhou and Will Eagles TeloX: Telomere Motif Extraction Tool. 
 Wellcome Sanger Institute, 2025.
 ```
 

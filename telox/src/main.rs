@@ -28,8 +28,9 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::env;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 mod kmers;
-use kmers::{count_kmers_in_fasta, print_kmer_table, analyze_strand_bias, print_strand_bias_table, save_strand_bias_table, get_strand_bias_summary, longest_continuous_stretch_for_kmers, filter_strand_bias_tsvs, consolidate_rotational_kmers, extract_last_n_bp_to_fasta};
+use kmers::{count_kmers_last_n_bp_parallel, analyze_strand_bias, analyze_strand_bias_with_indels, consolidate_ranked_motifs_by_rotation, extract_last_n_bp_to_fasta, run_kmc, run_kmc_dump, read_kmc_counts, analyze_kmc_kmers, longest_continuous_stretch_for_kmers, longest_continuous_stretch_with_indels};
 
 // Constants
 const TELO_PENALTY: i64 = 1;
@@ -89,6 +90,26 @@ struct Sequence {
 
 struct SequenceDict {
     sequences: Vec<Sequence>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MotifFrequency {
+    motif: String,
+    frequency: usize,
+    percentage: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TelomereCandidate {
+    status: String,
+    primary_motif: Option<String>,
+    frequency: Option<usize>,
+    percentage: Option<f64>,
+    source: Option<String>,
+    total_occurrences: Option<usize>,
+    unique_motifs: Option<usize>,
+    top_motifs: Vec<MotifFrequency>,
+    message: Option<String>,
 }
 
 impl SequenceDict {
@@ -400,8 +421,19 @@ fn report_most_frequent_motifs(initial_anno_file: &str, final_anno_file: &str) -
     } else {
         println!("No annotation files found. No telomere motifs detected.");
         // Write empty result to telomere_candidate.txt
-        let mut candidate_file = File::create("telomere_candidate.txt")?;
-        writeln!(candidate_file, "No telomere motifs detected in the genome.")?;
+        let candidate = TelomereCandidate {
+            status: "no_motifs".to_string(),
+            primary_motif: None,
+            frequency: None,
+            percentage: None,
+            source: None,
+            total_occurrences: Some(0),
+            unique_motifs: Some(0),
+            top_motifs: vec![],
+            message: Some("No telomere motifs detected in the genome.".to_string()),
+        };
+        let json_output = serde_json::to_string_pretty(&candidate)?;
+        std::fs::write("telomere_candidate.json", json_output)?;
         return Ok(());
     };
     
@@ -412,8 +444,19 @@ fn report_most_frequent_motifs(initial_anno_file: &str, final_anno_file: &str) -
     if motif_frequencies.is_empty() {
         println!("No telomere motifs found in the annotation file.");
         // Write empty result to telomere_candidate.txt
-        let mut candidate_file = File::create("telomere_candidate.txt")?;
-        writeln!(candidate_file, "No telomere motifs found in the annotation file.")?;
+        let candidate = TelomereCandidate {
+            status: "no_motifs".to_string(),
+            primary_motif: None,
+            frequency: None,
+            percentage: None,
+            source: Some(source.to_string()),
+            total_occurrences: Some(0),
+            unique_motifs: Some(0),
+            top_motifs: vec![],
+            message: Some("No telomere motifs found in the annotation file.".to_string()),
+        };
+        let json_output = serde_json::to_string_pretty(&candidate)?;
+        std::fs::write("telomere_candidate.json", json_output)?;
         return Ok(());
     }
     
@@ -440,27 +483,32 @@ fn report_most_frequent_motifs(initial_anno_file: &str, final_anno_file: &str) -
         println!("Occurrences: {} ({:.1}% of all detected motifs)", top_count, percentage);
         println!("Source: {}", source);
         
-        // Write the primary telomere motif to telomere_candidate.txt
-        let mut candidate_file = File::create("telomere_candidate.txt")?;
-        writeln!(candidate_file, "PRIMARY TELOMERE MOTIF CANDIDATE")?;
-        writeln!(candidate_file, "=================================")?;
-        writeln!(candidate_file, "Motif: {}", top_motif)?;
-        writeln!(candidate_file, "Frequency: {} occurrences", top_count)?;
-        writeln!(candidate_file, "Percentage: {:.1}% of all detected motifs", percentage)?;
-        writeln!(candidate_file, "Source: {}", source)?;
-        writeln!(candidate_file, "Total motif occurrences: {}", total_occurrences)?;
-        writeln!(candidate_file, "Unique motifs detected: {}", motif_frequencies.len())?;
-        writeln!(candidate_file)?;
-        writeln!(candidate_file, "Top 10 most frequent motifs:")?;
-        writeln!(candidate_file, "{:<20} {:<10} {:<10}", "Motif", "Frequency", "Percentage")?;
-        writeln!(candidate_file, "{}", "-".repeat(40))?;
+        // Create top motifs list
+        let top_motifs: Vec<MotifFrequency> = motif_frequencies.iter().take(10).map(|(motif, count)| {
+            MotifFrequency {
+                motif: motif.clone(),
+                frequency: *count,
+                percentage: (*count as f64 / total_occurrences as f64) * 100.0,
+            }
+        }).collect();
         
-        for (motif, count) in motif_frequencies.iter().take(10) {
-            let percentage = (*count as f64 / total_occurrences as f64) * 100.0;
-            writeln!(candidate_file, "{:<20} {:<10} {:<10.1}%", motif, count, percentage)?;
-        }
+        // Write the primary telomere motif to telomere_candidate.txt as JSON
+        let candidate = TelomereCandidate {
+            status: "success".to_string(),
+            primary_motif: Some(top_motif.clone()),
+            frequency: Some(*top_count),
+            percentage: Some(percentage),
+            source: Some(source.to_string()),
+            total_occurrences: Some(total_occurrences),
+            unique_motifs: Some(motif_frequencies.len()),
+            top_motifs,
+            message: None,
+        };
         
-        println!("Primary telomere motif written to: telomere_candidate.txt");
+        let json_output = serde_json::to_string_pretty(&candidate)?;
+        std::fs::write("telomere_candidate.json", json_output)?;
+        
+        println!("Primary telomere motif written to: telomere_candidate.json");
     }
     
     // Save detailed results to a file
@@ -486,15 +534,68 @@ fn report_most_frequent_motifs(initial_anno_file: &str, final_anno_file: &str) -
     Ok(())
 }
 
+fn parse_args(args: &[String]) -> (String, usize, usize, bool) {
+    let mut fasta_file = String::new();
+    let mut max_indels = 5;
+    let mut max_gap_size = 5;
+    let mut strict_mode = false;
+    
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max-indels" => {
+                if i + 1 < args.len() {
+                    max_indels = args[i + 1].parse().unwrap_or(5);
+                    i += 2;
+                } else {
+                    eprintln!("Error: --max-indels requires a value");
+                    std::process::exit(1);
+                }
+            }
+            "--max-gap-size" => {
+                if i + 1 < args.len() {
+                    max_gap_size = args[i + 1].parse().unwrap_or(5);
+                    i += 2;
+                } else {
+                    eprintln!("Error: --max-gap-size requires a value");
+                    std::process::exit(1);
+                }
+            }
+            "--strict" => {
+                strict_mode = true;
+                i += 1;
+            }
+            _ => {
+                if !args[i].starts_with("--") && fasta_file.is_empty() {
+                    fasta_file = args[i].clone();
+                }
+                i += 1;
+            }
+        }
+    }
+    
+    (fasta_file, max_indels, max_gap_size, strict_mode)
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <fasta_file> [extract_lastN <N> <output_fasta>]", args[0]);
+        eprintln!("Usage: {} <fasta_file> [options]", args[0]);
         eprintln!("       {} kmc <input_fasta> <k> <db_prefix> <output_txt>", args[0]);
-        eprintln!("Example: {} genome.fasta", args[0]);
-        eprintln!("         {} genome.fasta extract_lastN 5000 last5000.fasta", args[0]);
-        eprintln!("         {} kmc last5000.fasta 7 kmc_db kmc_dump.txt", args[0]);
+        eprintln!("       {} <fasta_file> extract_lastN <N> <output_fasta>", args[0]);
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --max-indels <N>      Maximum indels allowed in stretch analysis (default: 5)");
+        eprintln!("  --max-gap-size <N>    Maximum gap size before resetting stretch (default: 5)");
+        eprintln!("  --strict              Use exact matching only (no indel tolerance)");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  {} genome.fasta                           # Standard analysis with indel tolerance", args[0]);
+        eprintln!("  {} genome.fasta --max-indels 3 --max-gap-size 3  # More strict indel tolerance", args[0]);
+        eprintln!("  {} genome.fasta --strict                  # Exact matching only", args[0]);
+        eprintln!("  {} genome.fasta extract_lastN 10000 last10000.fasta", args[0]);
+        eprintln!("  {} kmc last5000.fasta 7 kmc_db kmc_dump.txt", args[0]);
         std::process::exit(1);
     }
 
@@ -520,17 +621,41 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let fasta_path = args[1].clone();
-
-    // Optionally extract last N bp to a new FASTA file
-    if args.len() == 5 && args[2] == "extract_lastN" {
-        let n: usize = args[3].parse().expect("N must be an integer");
-        let output_fasta = &args[4];
-        extract_last_n_bp_to_fasta(&fasta_path, output_fasta, n)?;
-        println!("Extracted last {} bp of each scaffold to {}", n, output_fasta);
-        return Ok(());
+    // Handle special modes first
+    if args.contains(&"extract_lastN".to_string()) {
+        if let Some(pos) = args.iter().position(|x| x == "extract_lastN") {
+            if pos + 2 < args.len() {
+                let fasta_path = &args[1];
+                let n: usize = args[pos + 1].parse().expect("N must be an integer");
+                let output_fasta = &args[pos + 2];
+                extract_last_n_bp_to_fasta(fasta_path, output_fasta, n)?;
+                println!("Extracted last {} bp of each scaffold ≥1MB to {}", n, output_fasta);
+                return Ok(());
+            }
+        }
     }
 
+    // Parse command line arguments
+    let (fasta_path, max_indels, max_gap_size, strict_mode) = parse_args(&args);
+    
+    if fasta_path.is_empty() {
+        eprintln!("Error: FASTA file not specified");
+        std::process::exit(1);
+    }
+
+    // Default analysis: extract last 5000bp and run telomere analysis
+    const DEFAULT_BP_SIZE: usize = 5000;
+    
+    println!("=== TeloX Telomere Analysis ===");
+    println!("Input: {}", fasta_path);
+    println!("Analyzing last {} bp of scaffolds ≥1MB", DEFAULT_BP_SIZE);
+    if strict_mode {
+        println!("Mode: Exact matching (no indel tolerance)");
+    } else {
+        println!("Mode: Indel-tolerant (max_indels: {}, max_gap_size: {})", max_indels, max_gap_size);
+    }
+    println!();
+    
     // Step 1: First run telo_finder on TELO_MOTIF_DB
     println!("Step 1: Running telo_finder with predefined TELO_MOTIF_DB...");
     let mut initial_anno_file = std::fs::File::create("initial_anno.txt")?;
@@ -550,81 +675,133 @@ fn main() -> Result<()> {
     // Step 2: If no telomeres found, run k-mer analysis to generate new motifs
     println!("Step 2: Running k-mer analysis to discover potential telomere motifs...");
     
-    for k in 5..=12 {
+    for k in 5..=15 {
         println!("Processing {}-mers...", k);
         
-        // Use optimized k-mer counting for last 5000bp of each scaffold
-        let counts = kmers::count_kmers_last_5000bp_parallel(&fasta_path, k)
-            .with_context(|| format!("Failed to count {}-mers in last 5000bp of {}", k, &fasta_path))?;
+        // Use optimized k-mer counting for last N bp of each scaffold ≥1MB
+        let counts = kmers::count_kmers_last_n_bp_parallel(&fasta_path, k, DEFAULT_BP_SIZE)
+            .with_context(|| format!("Failed to count {}-mers in last {}bp of {}", k, DEFAULT_BP_SIZE, &fasta_path))?;
 
-        // Calculate longest stretch for each k-mer using only the last 5000bp of each scaffold
+        // Print k-mer count table for debugging
+        println!("Top 20 {}-mers by count:", k);
+        kmers::print_kmer_table(&counts, 20);
+
+        // Calculate longest stretch for each k-mer using only the last N bp of each scaffold ≥1MB
         let sdict = SequenceDict::from_fasta(&fasta_path)?;
         let kmer_list: Vec<String> = counts.keys().cloned().collect();
         let mut longest_stretch_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut longest_stretch_indels_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut processed_scaffolds = 0;
+        let mut filtered_scaffolds = 0;
+        
+        // Use configured indel tolerance parameters
+        
         for seq in &sdict.sequences {
-            let region = if seq.seq.len() <= 5000 {
+            // Only process scaffolds larger than 1MB (1,000,000 bp)
+            if seq.seq.len() < 1_000_000 {
+                filtered_scaffolds += 1;
+                continue;
+            }
+            
+            processed_scaffolds += 1;
+            let region = if seq.seq.len() <= DEFAULT_BP_SIZE {
                 &seq.seq[..]
             } else {
-                &seq.seq[seq.seq.len() - 5000..]
+                &seq.seq[seq.seq.len() - DEFAULT_BP_SIZE..]
             };
+            
+            // Calculate exact stretch
             let stretch_map = kmers::longest_continuous_stretch_for_kmers(region, &kmer_list);
+            
+            // Calculate indel-tolerant stretch (only if not in strict mode)
+            let stretch_indels_map = if strict_mode {
+                stretch_map.clone()  // Use exact stretch for both
+            } else {
+                kmers::longest_continuous_stretch_with_indels(region, &kmer_list, max_indels, max_gap_size)
+            };
+            
             for (kmer, stretch) in stretch_map {
                 let entry = longest_stretch_map.entry(kmer).or_insert(0);
                 if stretch > *entry {
                     *entry = stretch;
                 }
             }
+            
+            for (kmer, stretch) in stretch_indels_map {
+                let entry = longest_stretch_indels_map.entry(kmer).or_insert(0);
+                if stretch > *entry {
+                    *entry = stretch;
+                }
+            }
         }
         
-        // Strand bias analysis
-        let mut bias_analyses = kmers::analyze_strand_bias(&counts, Some(&longest_stretch_map));
+        if k == 6 { // Only print this once to avoid spam
+            eprintln!("Longest stretch calculation: processed {} scaffolds >= 1MB, filtered out {} smaller scaffolds", processed_scaffolds, filtered_scaffolds);
+            eprintln!("Using last {} bp of each large scaffold for analysis", DEFAULT_BP_SIZE);
+        }
         
-        // Filter out k-mers with longest stretch < 2 and weak significance
-        let filtered_analyses: Vec<&kmers::StrandBiasAnalysis> = bias_analyses.iter()
-            .filter(|analysis| {
-                analysis.longest_stretch >= 2 && analysis.significance != "weak"
-            })
-            .collect();
+        // Print top longest stretch results for debugging
+        let mut stretch_debug: Vec<_> = longest_stretch_map.iter().collect();
+        stretch_debug.sort_by(|a, b| b.1.cmp(a.1));
+        println!("Top 10 {}-mers by longest stretch:", k);
+        for (i, (kmer, stretch)) in stretch_debug.iter().take(10).enumerate() {
+            let count = counts.get(*kmer).map(|p| p.forward + p.rc).unwrap_or(0);
+            println!("  {}: {} (stretch: {}, count: {})", i+1, kmer, stretch, count);
+        }
+
+        // Strand bias analysis with both exact and indel-tolerant stretch metrics
+        let bias_analyses = kmers::analyze_strand_bias_with_indels(&counts, Some(&longest_stretch_map), Some(&longest_stretch_indels_map));
         
-        // Save strand bias results
+        // Save strand bias results with new indel-tolerant metrics
         let bias_output_filename = format!("strand_bias_{}mer.tsv", k);
-        let mut content = String::new();
-        content.push_str("Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\tLongestStretch\n");
-        for analysis in &bias_analyses {
-            let ratio_str = if analysis.bias_ratio == f64::INFINITY {
-                "inf".to_string()
-            } else {
-                format!("{:.3}", analysis.bias_ratio)
-            };
-            content.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                analysis.kmer,
-                analysis.forward_count,
-                analysis.rc_count,
-                analysis.total_count,
-                ratio_str,
-                analysis.bias_direction,
-                analysis.significance,
-                analysis.longest_stretch
-            ));
-        }
-        std::fs::write(&bias_output_filename, content)?;
+        kmers::save_strand_bias_table(&bias_analyses, &bias_output_filename)?;
         println!("Saved strand bias results to {}", bias_output_filename);
+        
+        // Print summary of improvements from indel tolerance
+        let improved_count = bias_analyses.iter().filter(|a| a.indel_tolerance_used).count();
+        if improved_count > 0 {
+            println!("  -> {} k-mers benefited from indel tolerance ({}%)", 
+                     improved_count, 
+                     (improved_count * 100) / bias_analyses.len());
+        }
     }
 
     // Instead of reading filtered files, gather all filtered analyses in memory and rank them
+    println!("Step 2 complete. Now ranking and consolidating k-mers...");
     let mut all_filtered_analyses = Vec::new();
-    for k in 5..=12 {
+    for k in 5..=15 {
         let bias_output_filename = format!("strand_bias_{}mer.tsv", k);
-        let file = std::fs::File::open(&bias_output_filename)?;
+        println!("Reading {}...", bias_output_filename);
+        
+        let file = match std::fs::File::open(&bias_output_filename) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Warning: Could not open {}: {}", bias_output_filename, e);
+                continue;
+            }
+        };
+        
         let reader = std::io::BufReader::new(file);
+        let mut line_count = 0;
+        let mut added_count = 0;
+        
         for (i, line) in reader.lines().enumerate() {
             let line = line?;
+            line_count += 1;
             if i == 0 || line.trim().is_empty() { continue; }
             let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() < 8 { continue; }
-            let longest_stretch: usize = cols[7].parse().unwrap_or(0);
+            if cols.len() < 10 { 
+                eprintln!("Warning: Line {} in {} has only {} columns, expected 10", i+1, bias_output_filename, cols.len());
+                continue; 
+            }
+            let longest_stretch_exact: usize = cols[7].parse().unwrap_or(0);
+            let longest_stretch_indels: usize = cols[8].parse().unwrap_or(0);
             let significance = cols[6];
-            if longest_stretch < 2 || significance == "weak" { continue; }
+            
+            // Use indel-tolerant stretch for filtering and ranking
+            let ranking_stretch = longest_stretch_indels;
+            
+            if ranking_stretch < 2 || significance == "weak" { continue; }
             all_filtered_analyses.push((
                 cols[0].to_string(), // kmer
                 cols[1].parse().unwrap_or(0), // forward
@@ -633,15 +810,20 @@ fn main() -> Result<()> {
                 cols[4].to_string(), // bias_ratio
                 cols[5].to_string(), // direction
                 cols[6].to_string(), // significance
-                longest_stretch,
+                ranking_stretch,     // use indel-tolerant stretch for ranking
             ));
+            added_count += 1;
         }
+        println!("  Read {} lines, added {} filtered k-mers", line_count, added_count);
     }
     // Sort by longest_stretch DESC, then total DESC
+    println!("Sorting {} total k-mers...", all_filtered_analyses.len());
     all_filtered_analyses.sort_by(|a, b| b.7.cmp(&a.7).then(b.3.cmp(&a.3)));
+    
     // Write to rank.tsv
+    println!("Writing ranked results to rank.tsv...");
     let mut out = std::fs::File::create("rank.tsv")?;
-    writeln!(out, "Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\tLongestStretch")?;
+    writeln!(out, "Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\tLongestStretchIndels")?;
     for k in all_filtered_analyses {
         writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", k.0, k.1, k.2, k.3, k.4, k.5, k.6, k.7)?;
     }
@@ -666,9 +848,6 @@ fn main() -> Result<()> {
     }
     
     println!("Analysis complete.");
-
-    // Report most frequent telomere motifs
-    report_most_frequent_motifs("initial_anno.txt", "anno.txt")?;
 
     Ok(())
 }
