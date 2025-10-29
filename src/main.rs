@@ -24,13 +24,21 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Write, BufReader};
 use std::path::Path;
 use std::env;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use flate2::read::GzDecoder;
 mod kmers;
-use kmers::{count_kmers_last_n_bp_parallel, analyze_strand_bias, analyze_strand_bias_with_indels, consolidate_ranked_motifs_by_rotation, extract_last_n_bp_to_fasta, run_kmc, run_kmc_dump, read_kmc_counts, analyze_kmc_kmers, longest_continuous_stretch_for_kmers, longest_continuous_stretch_with_indels};
+mod annotation;
+use kmers::{
+    count_kmers_last_n_bp_parallel, analyze_strand_bias, analyze_strand_bias_with_indels, 
+    consolidate_ranked_motifs_by_rotation, extract_last_n_bp_to_fasta, run_kmc, run_kmc_dump, 
+    read_kmc_counts, analyze_kmc_kmers, longest_continuous_stretch_for_kmers, 
+    longest_continuous_stretch_with_indels, calculate_kmer_window_density
+};
+use annotation::{annotate_genome_with_motifs, create_annotation_config};
 
 // Constants
 const TELO_PENALTY: i64 = 1;
@@ -114,8 +122,16 @@ struct TelomereCandidate {
 
 impl SequenceDict {
     fn from_fasta<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let reader = io::BufReader::new(file);
+        let file = File::open(&path)?;
+        let path_str = path.as_ref().to_string_lossy();
+        
+        // Create appropriate reader based on file extension
+        let reader: Box<dyn BufRead> = if path_str.ends_with(".gz") {
+            Box::new(BufReader::new(GzDecoder::new(file)))
+        } else {
+            Box::new(BufReader::new(file))
+        };
+        
         let mut sequences = Vec::new();
         let mut current_name = String::new();
         let mut current_seq = String::new();
@@ -409,6 +425,48 @@ fn analyze_annotation_file(anno_file: &str) -> Result<Vec<(String, usize)>> {
     Ok(sorted_motifs)
 }
 
+/// Extract the most frequent motif from annotation file
+fn extract_primary_motif_from_anno(anno_file: &str) -> Result<String> {
+    let file = File::open(anno_file)?;
+    let reader = io::BufReader::new(file);
+    let mut motif_counts = std::collections::HashMap::new();
+    
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 4 {
+            let motif = parts[3].to_string();
+            *motif_counts.entry(motif).or_insert(0) += 1;
+        }
+    }
+    
+    if motif_counts.is_empty() {
+        return Err(anyhow::anyhow!("No motifs found in annotation file"));
+    }
+    
+    // Find most frequent motif
+    let primary_motif = motif_counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(motif, _)| motif.clone())
+        .ok_or_else(|| anyhow::anyhow!("Could not determine primary motif"))?;
+    
+    println!("Motif frequency analysis from {}:", anno_file);
+    let mut sorted_motifs: Vec<_> = motif_counts.iter().collect();
+    sorted_motifs.sort_by(|a, b| b.1.cmp(a.1));
+    
+    for (motif, count) in sorted_motifs.iter().take(5) {
+        let percentage = (**count as f64 / motif_counts.values().sum::<usize>() as f64) * 100.0;
+        println!("  {}: {} occurrences ({:.1}%)", motif, count, percentage);
+    }
+    
+    Ok(primary_motif)
+}
+
 /// Report the most frequent telomere motifs from annotation files
 fn report_most_frequent_motifs(initial_anno_file: &str, final_anno_file: &str) -> Result<()> {
     println!("\n=== TELOMERE MOTIF FREQUENCY ANALYSIS ===");
@@ -534,11 +592,14 @@ fn report_most_frequent_motifs(initial_anno_file: &str, final_anno_file: &str) -
     Ok(())
 }
 
-fn parse_args(args: &[String]) -> (String, usize, usize, bool) {
+fn parse_args(args: &[String]) -> (String, usize, usize, bool, bool, f64, bool) {
     let mut fasta_file = String::new();
     let mut max_indels = 5;
     let mut max_gap_size = 5;
     let mut strict_mode = false;
+    let mut annotate_genome = false;
+    let mut annotation_threshold = 0.5;
+    let mut use_window_density = false;
     
     let mut i = 1;
     while i < args.len() {
@@ -565,6 +626,23 @@ fn parse_args(args: &[String]) -> (String, usize, usize, bool) {
                 strict_mode = true;
                 i += 1;
             }
+            "--annotate" => {
+                annotate_genome = true;
+                i += 1;
+            }
+            "--window-density" => {
+                use_window_density = true;
+                i += 1;
+            }
+            "--annotation-threshold" => {
+                if i + 1 < args.len() {
+                    annotation_threshold = args[i + 1].parse().unwrap_or(0.5);
+                    i += 2;
+                } else {
+                    eprintln!("Error: --annotation-threshold requires a value");
+                    std::process::exit(1);
+                }
+            }
             _ => {
                 if !args[i].starts_with("--") && fasta_file.is_empty() {
                     fasta_file = args[i].clone();
@@ -574,7 +652,7 @@ fn parse_args(args: &[String]) -> (String, usize, usize, bool) {
         }
     }
     
-    (fasta_file, max_indels, max_gap_size, strict_mode)
+    (fasta_file, max_indels, max_gap_size, strict_mode, annotate_genome, annotation_threshold, use_window_density)
 }
 
 fn main() -> Result<()> {
@@ -585,15 +663,23 @@ fn main() -> Result<()> {
         eprintln!("       {} kmc <input_fasta> <k> <db_prefix> <output_txt>", args[0]);
         eprintln!("       {} <fasta_file> extract_lastN <N> <output_fasta>", args[0]);
         eprintln!();
+        eprintln!("Note: Supports both .fasta and .fasta.gz files");
+        eprintln!();
         eprintln!("Options:");
         eprintln!("  --max-indels <N>      Maximum indels allowed in stretch analysis (default: 5)");
         eprintln!("  --max-gap-size <N>    Maximum gap size before resetting stretch (default: 5)");
         eprintln!("  --strict              Use exact matching only (no indel tolerance)");
+        eprintln!("  --annotate            Generate genome annotation with BED file output");
+        eprintln!("  --annotation-threshold <F>  Score threshold for annotations (default: 0.5)");
+        eprintln!("  --window-density      Use 1000bp window density instead of longest stretch");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} genome.fasta                           # Standard analysis with indel tolerance", args[0]);
         eprintln!("  {} genome.fasta --max-indels 3 --max-gap-size 3  # More strict indel tolerance", args[0]);
         eprintln!("  {} genome.fasta --strict                  # Exact matching only", args[0]);
+        eprintln!("  {} genome.fasta --annotate                # Generate BED file annotations", args[0]);
+        eprintln!("  {} genome.fasta.gz --window-density       # Use window-based k-mer density (gzipped)", args[0]);
+        eprintln!("  {} genome.fasta --annotate --annotation-threshold 0.7  # Higher threshold", args[0]);
         eprintln!("  {} genome.fasta extract_lastN 10000 last10000.fasta", args[0]);
         eprintln!("  {} kmc last5000.fasta 7 kmc_db kmc_dump.txt", args[0]);
         std::process::exit(1);
@@ -636,7 +722,7 @@ fn main() -> Result<()> {
     }
 
     // Parse command line arguments
-    let (fasta_path, max_indels, max_gap_size, strict_mode) = parse_args(&args);
+    let (fasta_path, max_indels, max_gap_size, strict_mode, annotate_genome, annotation_threshold, use_window_density) = parse_args(&args);
     
     if fasta_path.is_empty() {
         eprintln!("Error: FASTA file not specified");
@@ -666,6 +752,93 @@ fn main() -> Result<()> {
     
     if found_any_telomeres {
         println!("Found telomere motifs with predefined database. Results written to initial_anno.txt");
+        
+        // Create JSON output for telo_finder results
+        match extract_primary_motif_from_anno("initial_anno.txt") {
+            Ok(primary_motif) => {
+                println!("Creating JSON output for telo_finder results...");
+                
+                // Count total occurrences of the primary motif
+                let mut total_count = 0;
+                let mut forward_count = 0;
+                let mut reverse_count = 0;
+                
+                if let Ok(contents) = std::fs::read_to_string("initial_anno.txt") {
+                    for line in contents.lines() {
+                        if !line.trim().is_empty() && !line.starts_with('#') {
+                            let parts: Vec<&str> = line.split('\t').collect();
+                            if parts.len() >= 4 && parts[3] == primary_motif {
+                                total_count += 1;
+                                if parts.len() >= 5 && parts[4] == "+" {
+                                    forward_count += 1;
+                                } else if parts.len() >= 5 && parts[4] == "-" {
+                                    reverse_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Create JSON structure
+                let telomere_result = serde_json::json!({
+                    "canonical_motif": primary_motif,
+                    "rotational_variants": [primary_motif],
+                    "forward_count": forward_count,
+                    "reverse_count": reverse_count,
+                    "total_count": total_count,
+                    "longest_stretch": 0, // telo_finder doesn't calculate stretch
+                    "data_source": "telo_finder_predefined_database"
+                });
+                
+                // Write to JSON file
+                match std::fs::write("telomere_motif_final.json", serde_json::to_string_pretty(&telomere_result).unwrap()) {
+                    Ok(_) => {
+                        println!("Primary telomere motif identified by telo_finder:");
+                        println!("Canonical sequence: {}", primary_motif);
+                        println!("Total occurrences: {} (Forward: {}, Reverse: {})", total_count, forward_count, reverse_count);
+                        println!("Result written to: telomere_motif_final.json");
+                    },
+                    Err(e) => {
+                        eprintln!("Error writing telomere_motif_final.json: {}", e);
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!("Warning: Could not extract primary motif from telo_finder results: {}", e);
+            }
+        }
+        
+        // Step 4: Genome annotation (if requested)
+        if annotate_genome {
+            println!("\nStep 4: Generating genome annotations with identified telomere motifs...");
+            
+            // Extract the most frequent motif from initial_anno.txt
+            match extract_primary_motif_from_anno("initial_anno.txt") {
+                Ok(primary_motif) => {
+                    println!("Primary motif identified from telo_finder results: {}", primary_motif);
+                    
+                    let primary_motif_vec = vec![primary_motif.clone()];
+                    let annotation_config = create_annotation_config(
+                        Some(annotation_threshold),
+                        Some(max_gap_size * 10), // Use larger gap for annotation merging
+                        Some(true), // Enable merging
+                    );
+                    
+                    let output_prefix = "telox_genome";
+                    match annotate_genome_with_motifs(&fasta_path, &primary_motif_vec, output_prefix, Some(annotation_config)) {
+                        Ok(_annotations) => {
+                            println!("Genome annotation completed successfully with motif: {}", primary_motif);
+                        },
+                        Err(e) => eprintln!("Warning: Genome annotation failed: {}", e),
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Warning: Could not extract primary motif from initial_anno.txt: {}", e);
+                    println!("Skipping genome annotation.");
+                }
+            }
+        }
+        
         println!("Analysis complete.");
         return Ok(());
     }
@@ -710,11 +883,17 @@ fn main() -> Result<()> {
                 &seq.seq[seq.seq.len() - DEFAULT_BP_SIZE..]
             };
             
-            // Calculate exact stretch
-            let stretch_map = kmers::longest_continuous_stretch_for_kmers(region, &kmer_list);
+            // Calculate stretch using selected method
+            let stretch_map = if use_window_density {
+                // Use 1000bp window density approach
+                kmers::calculate_kmer_window_density(region, &kmer_list, 1000)
+            } else {
+                // Use traditional longest stretch
+                kmers::longest_continuous_stretch_for_kmers(region, &kmer_list)
+            };
             
-            // Calculate indel-tolerant stretch (only if not in strict mode)
-            let stretch_indels_map = if strict_mode {
+            // Calculate indel-tolerant stretch (only if not in strict mode and not using window density)
+            let stretch_indels_map = if strict_mode || use_window_density {
                 stretch_map.clone()  // Use exact stretch for both
             } else {
                 kmers::longest_continuous_stretch_with_indels(region, &kmer_list, max_indels, max_gap_size)
@@ -743,7 +922,8 @@ fn main() -> Result<()> {
         // Print top longest stretch results for debugging
         let mut stretch_debug: Vec<_> = longest_stretch_map.iter().collect();
         stretch_debug.sort_by(|a, b| b.1.cmp(a.1));
-        println!("Top 10 {}-mers by longest stretch:", k);
+        let method_name = if use_window_density { "window density (1000bp)" } else { "longest stretch" };
+        println!("Top 10 {}-mers by {} method:", k, method_name);
         for (i, (kmer, stretch)) in stretch_debug.iter().take(10).enumerate() {
             let count = counts.get(*kmer).map(|p| p.forward + p.rc).unwrap_or(0);
             println!("  {}: {} (stretch: {}, count: {})", i+1, kmer, stretch, count);
@@ -794,6 +974,7 @@ fn main() -> Result<()> {
                 eprintln!("Warning: Line {} in {} has only {} columns, expected 10", i+1, bias_output_filename, cols.len());
                 continue; 
             }
+            let total: u32 = cols[3].parse().unwrap_or(0);
             let longest_stretch_exact: usize = cols[7].parse().unwrap_or(0);
             let longest_stretch_indels: usize = cols[8].parse().unwrap_or(0);
             let significance = cols[6];
@@ -801,7 +982,7 @@ fn main() -> Result<()> {
             // Use indel-tolerant stretch for filtering and ranking
             let ranking_stretch = longest_stretch_indels;
             
-            if ranking_stretch < 2 || significance == "weak" { continue; }
+            if ranking_stretch <= 3 || significance == "weak" || total <= 10 { continue; }
             all_filtered_analyses.push((
                 cols[0].to_string(), // kmer
                 cols[1].parse().unwrap_or(0), // forward
@@ -823,7 +1004,8 @@ fn main() -> Result<()> {
     // Write to rank.tsv
     println!("Writing ranked results to rank.tsv...");
     let mut out = std::fs::File::create("rank.tsv")?;
-    writeln!(out, "Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\tLongestStretchIndels")?;
+    let header_method = if use_window_density { "WindowDensity1000bp" } else { "LongestStretchIndels" };
+    writeln!(out, "Kmer\tForward\tRC\tTotal\tBiasRatio\tDirection\tSignificance\t{}", header_method)?;
     for k in all_filtered_analyses {
         writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", k.0, k.1, k.2, k.3, k.4, k.5, k.6, k.7)?;
     }
@@ -831,23 +1013,122 @@ fn main() -> Result<()> {
 
     // Step 3: Generate new motif array from k-mer analysis and run telo_finder
     println!("Step 3: Generating new telomere motif database from k-mer analysis...");
-    let motifs = kmers::consolidate_ranked_motifs_by_rotation("rank.tsv")?;
-    println!("Running telo_finder with {} discovered motifs...", motifs.len());
+    let discovered_motifs = kmers::consolidate_ranked_motifs_by_rotation("rank.tsv")?;
+    println!("Running telo_finder with {} discovered motifs...", discovered_motifs.len());
     
     // Run telo_finder with the new motifs array and print results to anno.txt
     let mut anno_file = std::fs::File::create("anno.txt")?;
-    let final_telo_results = telo_finder(&fasta_path, None, Some(&mut anno_file), Some(&motifs))?;
+    let final_telo_results = telo_finder(&fasta_path, None, Some(&mut anno_file), Some(&discovered_motifs))?;
     
     // Check if any telomere motifs were found with the new database
     let found_any_telomeres_final = final_telo_results.iter().any(|(five_prime, three_prime)| *five_prime || *three_prime);
     
     if found_any_telomeres_final {
         println!("Found telomere motifs with discovered database. Results written to anno.txt");
+        
+        // Create JSON output for k-mer discovery telo_finder results
+        match extract_primary_motif_from_anno("anno.txt") {
+            Ok(primary_motif) => {
+                println!("Creating JSON output for k-mer discovery telo_finder results...");
+                
+                // Count total occurrences of the primary motif
+                let mut total_count = 0;
+                let mut forward_count = 0;
+                let mut reverse_count = 0;
+                
+                if let Ok(contents) = std::fs::read_to_string("anno.txt") {
+                    for line in contents.lines() {
+                        if !line.trim().is_empty() && !line.starts_with('#') {
+                            let parts: Vec<&str> = line.split('\t').collect();
+                            if parts.len() >= 4 && parts[3] == primary_motif {
+                                total_count += 1;
+                                if parts.len() >= 5 && parts[4] == "+" {
+                                    forward_count += 1;
+                                } else if parts.len() >= 5 && parts[4] == "-" {
+                                    reverse_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Get longest stretch from the consolidated ranking if available
+                let mut longest_stretch = 0;
+                if let Ok(contents) = std::fs::read_to_string("rank.tsv") {
+                    for line in contents.lines() {
+                        if !line.trim().is_empty() && !line.starts_with('#') {
+                            let parts: Vec<&str> = line.split('\t').collect();
+                            if parts.len() >= 2 && parts[0] == primary_motif {
+                                if let Ok(stretch) = parts[1].parse::<usize>() {
+                                    longest_stretch = stretch;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Create JSON structure
+                let telomere_result = serde_json::json!({
+                    "canonical_motif": primary_motif,
+                    "rotational_variants": [primary_motif],
+                    "forward_count": forward_count,
+                    "reverse_count": reverse_count,
+                    "total_count": total_count,
+                    "longest_stretch": longest_stretch,
+                    "data_source": "telo_finder_kmer_discovery"
+                });
+                
+                // Write to JSON file (overwrite if exists)
+                match std::fs::write("telomere_motif_final.json", serde_json::to_string_pretty(&telomere_result).unwrap()) {
+                    Ok(_) => {
+                        println!("Primary telomere motif identified by k-mer discovery telo_finder:");
+                        println!("Canonical sequence: {}", primary_motif);
+                        println!("Total occurrences: {} (Forward: {}, Reverse: {})", total_count, forward_count, reverse_count);
+                        println!("Longest stretch: {}", longest_stretch);
+                        println!("Result written to: telomere_motif_final.json");
+                    },
+                    Err(e) => {
+                        eprintln!("Error writing telomere_motif_final.json: {}", e);
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!("Warning: Could not extract primary motif from k-mer discovery telo_finder results: {}", e);
+            }
+        }
     } else {
         println!("No telomere motifs found even with discovered database.");
     }
     
     println!("Analysis complete.");
+
+    // Step 4: Genome annotation (if requested)
+    if annotate_genome {
+        println!("\nStep 4: Generating genome annotations...");
+        
+        // Use only the most likely telomere motif (first in consolidated ranking)
+        if let Some(primary_motif) = discovered_motifs.first() {
+            println!("Annotating genome with primary telomere motif: {}", primary_motif);
+            
+            let primary_motif_vec = vec![primary_motif.clone()];
+            let annotation_config = create_annotation_config(
+                Some(annotation_threshold),
+                Some(max_gap_size * 10), // Use larger gap for annotation merging
+                Some(true), // Enable merging
+            );
+            
+            let output_prefix = "telox_genome";
+            match annotate_genome_with_motifs(&fasta_path, &primary_motif_vec, output_prefix, Some(annotation_config)) {
+                Ok(_annotations) => {
+                    println!("Genome annotation completed successfully with motif: {}", primary_motif);
+                },
+                Err(e) => eprintln!("Warning: Genome annotation failed: {}", e),
+            }
+        } else {
+            println!("No telomere motifs available for annotation.");
+        }
+    }
 
     Ok(())
 }

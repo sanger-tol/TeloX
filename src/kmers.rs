@@ -106,6 +106,75 @@ fn reverse_complement(seq: &str) -> String {
         .collect()
 }
 
+/// Calculate k-mer density in sliding windows across the sequence
+/// This is more biologically relevant for telomeric regions with rotations and indels
+pub fn calculate_kmer_window_density(
+    sequence: &str,
+    kmers: &[String],
+    window_size: usize,
+) -> HashMap<String, usize> {
+    let seq_bytes = sequence.as_bytes();
+    if kmers.is_empty() || sequence.is_empty() || window_size == 0 {
+        return HashMap::new();
+    }
+    
+    let k = kmers[0].len();
+    if k == 0 || k > seq_bytes.len() || window_size < k {
+        return kmers.iter().map(|kmer| (kmer.clone(), 0)).collect();
+    }
+
+    // Create all rotational variants for each k-mer
+    let mut kmer_variants: HashMap<Vec<u8>, String> = HashMap::new();
+    for kmer in kmers {
+        let kmer_bytes = kmer.as_bytes().to_vec();
+        let rc_bytes = reverse_complement(kmer).as_bytes().to_vec();
+        
+        // Add all rotations of forward and reverse complement
+        for rotation in 0..k {
+            let mut rotated_forward = kmer_bytes.clone();
+            rotated_forward.rotate_left(rotation);
+            
+            let mut rotated_rc = rc_bytes.clone();
+            rotated_rc.rotate_left(rotation);
+            
+            kmer_variants.insert(rotated_forward, kmer.clone());
+            kmer_variants.insert(rotated_rc, kmer.clone());
+        }
+    }
+
+    // Slide window across sequence and count k-mer variants
+    let mut max_densities: HashMap<String, usize> = HashMap::new();
+    for kmer in kmers {
+        max_densities.insert(kmer.clone(), 0);
+    }
+
+    for window_start in 0..=(seq_bytes.len().saturating_sub(window_size)) {
+        let window_end = (window_start + window_size).min(seq_bytes.len());
+        let window = &seq_bytes[window_start..window_end];
+        
+        // Count each k-mer type in this window
+        let mut window_counts: HashMap<String, usize> = HashMap::new();
+        
+        for i in 0..=(window.len().saturating_sub(k)) {
+            let kmer_slice = &window[i..i + k];
+            
+            if let Some(canonical_kmer) = kmer_variants.get(kmer_slice) {
+                *window_counts.entry(canonical_kmer.clone()).or_insert(0) += 1;
+            }
+        }
+        
+        // Update maximum densities
+        for (kmer, count) in window_counts {
+            let current_max = max_densities.get(&kmer).unwrap_or(&0);
+            if count > *current_max {
+                max_densities.insert(kmer, count);
+            }
+        }
+    }
+
+    max_densities
+}
+
 /// For each k-mer, find the longest continuous stretch (number of consecutive, non-overlapping occurrences)
 /// in the sequence, checking both forward and reverse complement orientations, using a fast single-pass approach.
 pub fn longest_continuous_stretch_for_kmers(
@@ -421,7 +490,6 @@ pub fn count_kmers_in_fasta(
     let mut reader = parse_fastx_file(fasta_path)?;
     while let Some(record) = reader.next() {
         let seqrec = record?;
-        seqrec.normalize(true);
         let seq_len = seqrec.seq().len();
         let min_pos = if seq_len > 5000 { seq_len - 5000 } else { 0 };
         for (pos, kmer) in seqrec.kmers(k as u8).enumerate() {
@@ -662,7 +730,7 @@ pub fn get_strand_bias_summary(analyses: &[StrandBiasAnalysis]) -> (usize, usize
     (total, forward_biased, reverse_biased, balanced)
 }
 
-/// Filter multiple strand bias TSV files by LongestStretch >= 2 and Significance != "weak".
+/// Filter multiple strand bias TSV files by LongestStretch > 3, Significance != "weak", and Total > 10.
 /// Writes all passing rows to a single output file, with header only once.
 
 pub fn filter_strand_bias_tsvs(input_files: &[&str], output_file: &str) -> Result<()> {
@@ -684,10 +752,15 @@ pub fn filter_strand_bias_tsvs(input_files: &[&str], output_file: &str) -> Resul
             let record = result?;
             let stretch_idx = headers.iter().position(|h| h == "LongestStretch").ok_or_else(|| anyhow!("No LongestStretch column in {}", input_path))?;
             let sig_idx = headers.iter().position(|h| h == "Significance").ok_or_else(|| anyhow!("No Significance column in {}", input_path))?;
+            let total_idx = headers.iter().position(|h| h == "Total").ok_or_else(|| anyhow!("No Total column in {}", input_path))?;
+            
             let stretch: usize = record.get(stretch_idx).unwrap_or("0").parse().unwrap_or(0);
             let significance = record.get(sig_idx).unwrap_or("").trim().to_lowercase();
-            if stretch < 2 { continue; }
+            let total: u32 = record.get(total_idx).unwrap_or("0").parse().unwrap_or(0);
+            
+            if stretch <= 3 { continue; }
             if significance == "weak" { continue; }
+            if total <= 10 { continue; }
             writer.write_record(&record)?;
         }
     }
@@ -724,11 +797,11 @@ pub fn consolidate_rotational_kmers(kmers: &[String]) -> Vec<String> {
     result
 }
 
-/// Filter bias analyses to keep only those with longest_stretch >= 2 and significance != "weak".
+/// Filter bias analyses to keep only those with longest_stretch > 3, significance != "weak", and total_count > 10.
 pub fn filter_bias_analyses<'a>(analyses: &'a [StrandBiasAnalysis]) -> Vec<&'a StrandBiasAnalysis> {
     analyses
         .iter()
-        .filter(|a| a.longest_stretch >= 2 && a.significance != "weak")
+        .filter(|a| a.longest_stretch > 3 && a.significance != "weak" && a.total_count > 10)
         .collect()
 }
 
@@ -864,7 +937,6 @@ pub fn count_kmers_last_n_bp_parallel(
     
     while let Some(record) = reader.next() {
         let seqrec = record?;
-        seqrec.normalize(true);
         let seq = seqrec.seq().to_vec();
         
         // Only process scaffolds larger than 1MB (1,000,000 bp)

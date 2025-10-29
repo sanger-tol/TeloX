@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TeloX Telomere Visualizer</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .upload-area {
+            border: 2px dashed #ccc;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 20px;
+            cursor: pointer;
+            transition: border-color 0.3s;
+        }
+        .upload-area:hover {
+            border-color: #007bff;
+        }
+        .upload-area.dragover {
+            border-color: #007bff;
+            background-color: #f0f8ff;
+        }
+        .controls {
+            margin: 20px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }
+        .control-group {
+            display: inline-block;
+            margin-right: 20px;
+        }
+        label {
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        input, select {
+            padding: 5px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .stat-card {
+            background: #e9ecef;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #007bff;
+        }
+        .plot-container {
+            margin: 20px 0;
+            min-height: 400px;
+        }
+        #fileInput {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🧬 TeloX Telomere Visualizer</h1>
+        <p>Interactive visualization tool for TeloX BED file output</p>
+        
+        <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+            <h3>📁 Upload TeloX BED File</h3>
+            <p>Click here or drag and drop your <code>telox_genome_telomeres.bed</code> file</p>
+            <input type="file" id="fileInput" accept=".bed,.tsv,.txt" />
+        </div>
+        
+        <div class="controls" style="display: none;" id="controls">
+            <div class="control-group">
+                <label>Chromosome Filter:</label>
+                <select id="chrFilter">
+                    <option value="all">All Chromosomes</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Motif Filter:</label>
+                <select id="motifFilter">
+                    <option value="all">All Motifs</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Strand Filter:</label>
+                <select id="strandFilter">
+                    <option value="all">Both Strands</option>
+                    <option value="+">Forward (+)</option>
+                    <option value="-">Reverse (-)</option>
+                </select>
+            </div>
+            <button onclick="updateVisualization()">Update Visualization</button>
+        </div>
+        
+        <div class="stats" id="stats" style="display: none;"></div>
+        
+        <div class="plot-container">
+            <div id="ideogram"></div>
+        </div>
+        
+        <div class="plot-container">
+            <div id="summary"></div>
+        </div>
+    </div>
+
+    <script>
+        let telomereData = [];
+        let filteredData = [];
+
+        // File upload handling
+        const fileInput = document.getElementById('fileInput');
+        const uploadArea = document.querySelector('.upload-area');
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFile(files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFile(e.target.files[0]);
+            }
+        });
+
+        function handleFile(file) {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const content = e.target.result;
+                parseBedFile(content);
+            };
+            reader.readAsText(file);
+        }
+
+        function parseBedFile(content) {
+            const lines = content.split('\\n');
+            telomereData = [];
+            
+            for (const line of lines) {
+                if (line.startsWith('track') || line.trim() === '') continue;
+                
+                const cols = line.split('\\t');
+                if (cols.length >= 5) {
+                    telomereData.push({
+                        chr: cols[0],
+                        start: parseInt(cols[1]),
+                        end: parseInt(cols[2]),
+                        motif: cols[3],
+                        strand: cols[4],
+                        color: cols[5] || '255,0,0'
+                    });
+                }
+            }
+            
+            if (telomereData.length > 0) {
+                setupControls();
+                updateVisualization();
+                document.getElementById('controls').style.display = 'block';
+                document.getElementById('stats').style.display = 'grid';
+            } else {
+                alert('No telomere data found in file. Please check the format.');
+            }
+        }
+
+        function setupControls() {
+            // Populate chromosome filter
+            const chromosomes = [...new Set(telomereData.map(d => d.chr))].sort();
+            const chrFilter = document.getElementById('chrFilter');
+            chrFilter.innerHTML = '<option value="all">All Chromosomes</option>';
+            chromosomes.forEach(chr => {
+                chrFilter.innerHTML += `<option value="${chr}">${chr}</option>`;
+            });
+
+            // Populate motif filter
+            const motifs = [...new Set(telomereData.map(d => d.motif))].sort();
+            const motifFilter = document.getElementById('motifFilter');
+            motifFilter.innerHTML = '<option value="all">All Motifs</option>';
+            motifs.forEach(motif => {
+                motifFilter.innerHTML += `<option value="${motif}">${motif}</option>`;
+            });
+        }
+
+        function updateVisualization() {
+            // Apply filters
+            const chrFilter = document.getElementById('chrFilter').value;
+            const motifFilter = document.getElementById('motifFilter').value;
+            const strandFilter = document.getElementById('strandFilter').value;
+
+            filteredData = telomereData.filter(d => {
+                return (chrFilter === 'all' || d.chr === chrFilter) &&
+                       (motifFilter === 'all' || d.motif === motifFilter) &&
+                       (strandFilter === 'all' || d.strand === strandFilter);
+            });
+
+            updateStats();
+            createIdeogram();
+            createSummaryPlots();
+        }
+
+        function updateStats() {
+            const statsDiv = document.getElementById('stats');
+            const totalAnnotations = filteredData.length;
+            const chromosomes = new Set(filteredData.map(d => d.chr)).size;
+            const motifs = new Set(filteredData.map(d => d.motif)).size;
+            const forwardCount = filteredData.filter(d => d.strand === '+').length;
+            const reverseCount = filteredData.filter(d => d.strand === '-').length;
+
+            statsDiv.innerHTML = `
+                <div class="stat-card">
+                    <div class="stat-value">${totalAnnotations}</div>
+                    <div>Total Annotations</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${chromosomes}</div>
+                    <div>Chromosomes</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${motifs}</div>
+                    <div>Unique Motifs</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${forwardCount}</div>
+                    <div>Forward Strand</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${reverseCount}</div>
+                    <div>Reverse Strand</div>
+                </div>
+            `;
+        }
+
+        function createIdeogram() {
+            // Group by chromosome
+            const chrData = {};
+            filteredData.forEach(d => {
+                if (!chrData[d.chr]) chrData[d.chr] = [];
+                chrData[d.chr].push(d);
+            });
+
+            const chromosomes = Object.keys(chrData).sort();
+            const traces = [];
+
+            chromosomes.forEach((chr, i) => {
+                const chrAnnotations = chrData[chr];
+                
+                // Forward strand
+                const forwardAnns = chrAnnotations.filter(d => d.strand === '+');
+                if (forwardAnns.length > 0) {
+                    traces.push({
+                        x: forwardAnns.map(d => d.start),
+                        y: forwardAnns.map(d => chr),
+                        mode: 'markers',
+                        type: 'scatter',
+                        marker: {
+                            color: 'red',
+                            size: 8,
+                            symbol: 'triangle-right'
+                        },
+                        name: 'Forward (+)',
+                        text: forwardAnns.map(d => `${d.motif} (${d.start:,}-${d.end:,})`),
+                        hovertemplate: '<b>%{y}</b><br>Position: %{x:,}<br>%{text}<extra></extra>',
+                        showlegend: i === 0
+                    });
+                }
+
+                // Reverse strand
+                const reverseAnns = chrAnnotations.filter(d => d.strand === '-');
+                if (reverseAnns.length > 0) {
+                    traces.push({
+                        x: reverseAnns.map(d => d.start),
+                        y: reverseAnns.map(d => chr),
+                        mode: 'markers',
+                        type: 'scatter',
+                        marker: {
+                            color: 'blue',
+                            size: 8,
+                            symbol: 'triangle-left'
+                        },
+                        name: 'Reverse (-)',
+                        text: reverseAnns.map(d => `${d.motif} (${d.start:,}-${d.end:,})`),
+                        hovertemplate: '<b>%{y}</b><br>Position: %{x:,}<br>%{text}<extra></extra>',
+                        showlegend: i === 0
+                    });
+                }
+            });
+
+            const layout = {
+                title: 'Telomere Distribution Along Chromosomes',
+                xaxis: {
+                    title: 'Genomic Position (bp)',
+                    tickformat: ',d'
+                },
+                yaxis: {
+                    title: 'Chromosome'
+                },
+                height: Math.max(400, chromosomes.length * 50),
+                hovermode: 'closest',
+                showlegend: true
+            };
+
+            Plotly.newPlot('ideogram', traces, layout);
+        }
+
+        function createSummaryPlots() {
+            // Motif frequency
+            const motifCounts = {};
+            filteredData.forEach(d => {
+                motifCounts[d.motif] = (motifCounts[d.motif] || 0) + 1;
+            });
+
+            const sortedMotifs = Object.entries(motifCounts)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 10);
+
+            const motifTrace = {
+                x: sortedMotifs.map(m => m[1]),
+                y: sortedMotifs.map(m => m[0]),
+                type: 'bar',
+                orientation: 'h',
+                marker: {
+                    color: 'lightcoral',
+                    line: {
+                        color: 'darkred',
+                        width: 1
+                    }
+                }
+            };
+
+            const motifLayout = {
+                title: 'Top Telomere Motifs',
+                xaxis: { title: 'Count' },
+                yaxis: { title: 'Motif' },
+                height: 400
+            };
+
+            Plotly.newPlot('summary', [motifTrace], motifLayout);
+        }
+
+        // Initialize
+        console.log('TeloX Telomere Visualizer loaded');
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>🧬 TeloX Telomere Visualizer</h1>
+        <p>Interactive web-based visualization for TeloX telomere annotations</p>
+        
+        <div class="upload-area">
+            <h3>📁 Upload TeloX BED File</h3>
+            <p>Click here or drag and drop your <code>telox_genome_telomeres.bed</code> file</p>
+            <input type="file" id="fileInput" accept=".bed,.tsv,.txt" />
+        </div>
+        
+        <div class="controls" id="controls" style="display: none;">
+            <div class="control-group">
+                <label>Chromosome:</label>
+                <select id="chrFilter"></select>
+            </div>
+            <div class="control-group">
+                <label>Motif:</label>
+                <select id="motifFilter"></select>
+            </div>
+            <div class="control-group">
+                <label>Strand:</label>
+                <select id="strandFilter">
+                    <option value="all">Both Strands</option>
+                    <option value="+">Forward (+)</option>
+                    <option value="-">Reverse (-)</option>
+                </select>
+            </div>
+            <button onclick="updateVisualization()">Update Visualization</button>
+        </div>
+        
+        <div class="stats" id="stats" style="display: none;"></div>
+        
+        <div class="plot-container">
+            <div id="ideogram"></div>
+        </div>
+        
+        <div class="plot-container">
+            <div id="summary"></div>
+        </div>
+        
+        <div style="margin-top: 40px; padding: 20px; background: #f8f9fa; border-radius: 5px;">
+            <h3>📋 Instructions:</h3>
+            <ol>
+                <li>Run TeloX: <code>./target/release/telox genome.fasta --annotate</code></li>
+                <li>Upload the generated <code>telox_genome_telomeres.bed</code> file above</li>
+                <li>Use filters to explore specific chromosomes, motifs, or strands</li>
+                <li>Hover over points for detailed information</li>
+            </ol>
+            
+            <h3>🎨 Features:</h3>
+            <ul>
+                <li><strong>Interactive plots</strong> - Zoom, pan, hover for details</li>
+                <li><strong>Filtering</strong> - Focus on specific chromosomes, motifs, or strands</li>
+                <li><strong>Color coding</strong> - Red for forward (+), blue for reverse (-)</li>
+                <li><strong>Statistics</strong> - Real-time summary of filtered data</li>
+                <li><strong>No dependencies</strong> - Works in any modern web browser</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
