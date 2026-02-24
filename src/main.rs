@@ -754,57 +754,101 @@ fn main() -> Result<()> {
         println!("Found telomere motifs with predefined database. Results written to initial_anno.txt");
         
         // Create JSON output for telo_finder results
-        match extract_primary_motif_from_anno("initial_anno.txt") {
-            Ok(primary_motif) => {
-                println!("Creating JSON output for telo_finder results...");
-                
-                // Count total occurrences of the primary motif
-                let mut total_count = 0;
-                let mut forward_count = 0;
-                let mut reverse_count = 0;
-                
+        // Extract primary motif and calculate statistics
+        let primary_motif = match extract_primary_motif_from_anno("initial_anno.txt") {
+            Ok(motif) => motif,
+            Err(e) => {
+                eprintln!("Warning: Could not extract primary motif from telo_finder results: {}", e);
+                eprintln!("Attempting to create JSON with first available motif...");
+                // Fallback: try to get any motif from the file
+                let mut fallback_motif: Option<String> = None;
                 if let Ok(contents) = std::fs::read_to_string("initial_anno.txt") {
                     for line in contents.lines() {
                         if !line.trim().is_empty() && !line.starts_with('#') {
                             let parts: Vec<&str> = line.split('\t').collect();
-                            if parts.len() >= 4 && parts[3] == primary_motif {
-                                total_count += 1;
-                                if parts.len() >= 5 && parts[4] == "+" {
+                            if parts.len() >= 4 {
+                                fallback_motif = Some(parts[3].to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                fallback_motif.ok_or_else(|| anyhow::anyhow!("Could not determine primary motif from telo_finder results"))?
+            }
+        };
+        
+        println!("Creating JSON output for telo_finder results...");
+        
+        // Parse initial_anno.txt to count occurrences and calculate longest stretch
+        let mut total_count = 0;
+        let mut forward_count = 0;
+        let mut reverse_count = 0;
+        let mut longest_stretch = 0usize;
+        
+        if let Ok(contents) = std::fs::read_to_string("initial_anno.txt") {
+            for line in contents.lines() {
+                if !line.trim().is_empty() && !line.starts_with('#') {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 4 && parts[3] == primary_motif {
+                        total_count += 1;
+                        
+                        // Determine strand and calculate stretch from positions
+                        // Format: chromosome/seq_name, start, end, motif
+                        // telo_finder writes: 5' end as (seq_name, 0, end_pos, motif) and 3' end as (seq_name, start_pos, seq_len, motif)
+                        if parts.len() >= 4 {
+                            if let (Ok(start), Ok(end)) = (parts[1].parse::<usize>(), parts[2].parse::<usize>()) {
+                                let stretch = end - start;
+                                if stretch > longest_stretch {
+                                    longest_stretch = stretch;
+                                }
+                                
+                                // Infer strand from position:
+                                // - start == 0 means 5' end (forward strand, +)
+                                // - start > 0 means 3' end (reverse strand, -)
+                                if start == 0 {
                                     forward_count += 1;
-                                } else if parts.len() >= 5 && parts[4] == "-" {
+                                } else {
                                     reverse_count += 1;
                                 }
                             }
                         }
                     }
                 }
-                
-                // Create JSON structure
-                let telomere_result = serde_json::json!({
-                    "canonical_motif": primary_motif,
-                    "rotational_variants": [primary_motif],
-                    "forward_count": forward_count,
-                    "reverse_count": reverse_count,
-                    "total_count": total_count,
-                    "longest_stretch": 0, // telo_finder doesn't calculate stretch
-                    "data_source": "telo_finder_predefined_database"
-                });
-                
-                // Write to JSON file
-                match std::fs::write("telomere_motif_final.json", serde_json::to_string_pretty(&telomere_result).unwrap()) {
-                    Ok(_) => {
-                        println!("Primary telomere motif identified by telo_finder:");
-                        println!("Canonical sequence: {}", primary_motif);
-                        println!("Total occurrences: {} (Forward: {}, Reverse: {})", total_count, forward_count, reverse_count);
-                        println!("Result written to: telomere_motif_final.json");
-                    },
-                    Err(e) => {
-                        eprintln!("Error writing telomere_motif_final.json: {}", e);
-                    }
-                }
+            }
+        }
+        
+        // Convert longest_stretch from bp to number of motif repeats (approximate)
+        let motif_len = primary_motif.len();
+        let longest_stretch_repeats = if motif_len > 0 {
+            longest_stretch / motif_len
+        } else {
+            0
+        };
+        
+        // Create JSON structure matching Stage 2 format
+        let telomere_result = serde_json::json!({
+            "canonical_motif": primary_motif,
+            "rotational_variants": [primary_motif.clone()],
+            "forward_count": forward_count,
+            "reverse_count": reverse_count,
+            "total_count": total_count,
+            "longest_stretch": longest_stretch_repeats,
+            "longest_stretch_bp": longest_stretch,
+            "data_source": "telo_finder_predefined_database"
+        });
+        
+        // Write to JSON file (always create, even if some stats are missing)
+        match std::fs::write("telomere_motif_final.json", serde_json::to_string_pretty(&telomere_result).unwrap()) {
+            Ok(_) => {
+                println!("✓ Primary telomere motif identified by telo_finder:");
+                println!("  Canonical sequence: {}", primary_motif);
+                println!("  Total occurrences: {} (Forward: {}, Reverse: {})", total_count, forward_count, reverse_count);
+                println!("  Longest stretch: {} bp (approximately {} repeats)", longest_stretch, longest_stretch_repeats);
+                println!("  Result written to: telomere_motif_final.json");
             },
             Err(e) => {
-                eprintln!("Warning: Could not extract primary motif from telo_finder results: {}", e);
+                eprintln!("❌ Error writing telomere_motif_final.json: {}", e);
+                return Err(anyhow::anyhow!("Failed to write telomere_motif_final.json: {}", e));
             }
         }
         
